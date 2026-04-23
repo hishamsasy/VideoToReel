@@ -13,6 +13,7 @@ It uses classical AI and signal-processing techniques rather than a large neural
 - Vertical, horizontal, square, or original output formats
 - Multiple export quality presets
 - Optional fade transitions
+- Optional overlay audio track for the exported reel
 - AI scoring weight controls for motion, faces, and audio
 - Chronological ordering option
 
@@ -85,7 +86,7 @@ python main.py
 2. Choose the target reel duration.
 3. Choose the target clip length.
 4. Choose how many reels to generate.
-5. Set format, quality, and output directory.
+5. Set format, quality, optional overlay audio, and output directory.
 6. Adjust AI scoring weights if needed.
 7. Click `Analyse & Create Reel`.
 

@@ -308,6 +308,28 @@ class AIVideoToReelApp(ctk.CTk):
                       ).grid(row=r, column=0, sticky="w", padx=8, pady=2)
         r += 1
 
+        # ── Overlay Audio Track ─────────────────────────────────────────────
+        r = self._section(scroll, "Overlay Audio Track", r)
+        audio_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        audio_row.grid(row=r, column=0, sticky="ew", padx=6, pady=3)
+        audio_row.grid_columnconfigure(0, weight=1)
+
+        self.overlay_audio_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            audio_row,
+            textvariable=self.overlay_audio_var,
+            placeholder_text="Optional MP3, WAV, M4A, AAC, FLAC, OGG",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(audio_row, text="Browse", width=72,
+                      command=self._browse_overlay_audio,
+                      ).grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(audio_row, text="Clear", width=60,
+                      fg_color="#3a3a4a", hover_color="#4a4a5a",
+                      command=lambda: self.overlay_audio_var.set(""),
+                      ).grid(row=0, column=2)
+        r += 1
+
         # ── AI Scoring Weights ────────────────────────────────────────────────
         r = self._section(scroll, "AI Scoring Weights", r)
 
@@ -458,6 +480,17 @@ class AIVideoToReelApp(ctk.CTk):
         if d:
             self.out_dir_var.set(d)
 
+    def _browse_overlay_audio(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Overlay Audio Track",
+            filetypes=[
+                ("Audio Files", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if path:
+            self.overlay_audio_var.set(path)
+
     # ═══════════════════════════════════════════════════════════════ PROCESSING
 
     def _start(self) -> None:
@@ -471,6 +504,14 @@ class AIVideoToReelApp(ctk.CTk):
                                    "Please select an output directory.")
             return
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+        overlay_audio = self.overlay_audio_var.get().strip()
+        if overlay_audio and not Path(overlay_audio).is_file():
+            messagebox.showwarning(
+                "Invalid Audio Track",
+                "Please choose a valid overlay audio file or clear the field.",
+            )
+            return
 
         self.is_processing = True
         self._stop_flag = False
@@ -488,6 +529,7 @@ class AIVideoToReelApp(ctk.CTk):
             "transitions":    self.transitions_var.get(),
             "chronological":  self.chrono_var.get(),
             "output_dir":     out_dir,
+            "overlay_audio":  overlay_audio,
             "w_motion":       self.w_motion.get(),
             "w_faces":        self.w_faces.get(),
             "w_audio":        self.w_audio.get(),
@@ -587,6 +629,10 @@ class AIVideoToReelApp(ctk.CTk):
                 f"\n✓  Selected {total_segments} clips across {len(reels)} reel(s) "
                 f"(~{total_segments * clip_dur} s total)"
             )
+            if cfg["overlay_audio"]:
+                self._q_log(
+                    f"🎵  Overlay audio: {Path(cfg['overlay_audio']).name}"
+                )
 
             # ── phase 3 : assemble reels ─────────────────────────────────────
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -618,6 +664,7 @@ class AIVideoToReelApp(ctk.CTk):
                     output_format=cfg["output_format"],
                     quality=cfg["quality"],
                     transitions=cfg["transitions"],
+                    overlay_audio_path=cfg["overlay_audio"] or None,
                     progress_callback=_proc_cb,
                 )
 

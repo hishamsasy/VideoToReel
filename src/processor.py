@@ -37,6 +37,7 @@ class VideoProcessor:
         output_format: str = "Vertical (9:16)",
         quality: str = "High (1080p)",
         transitions: bool = True,
+        overlay_audio_path: Optional[str] = None,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> bool:
         """
@@ -110,6 +111,34 @@ class VideoProcessor:
             _cleanup(raw_clips, clips)
             raise RuntimeError(f"Concatenation failed: {exc}") from exc
 
+        overlay_audio_clip = None
+        if overlay_audio_path:
+            _cb(progress_callback, 0.75, "Mixing overlay audio…")
+            try:
+                overlay_audio_clip = mp.AudioFileClip(str(overlay_audio_path))
+                if overlay_audio_clip.duration <= 0:
+                    raise RuntimeError("overlay audio track is empty")
+
+                overlay_audio_clip = mp.afx.audio_loop(
+                    overlay_audio_clip,
+                    duration=final.duration,
+                ).subclip(0, final.duration)
+
+                audio_layers = [overlay_audio_clip.volumex(0.35)]
+                if final.audio is not None:
+                    audio_layers.insert(0, final.audio)
+
+                final = final.set_audio(mp.CompositeAudioClip(audio_layers))
+            except Exception as exc:
+                final.close()
+                _cleanup(raw_clips, clips)
+                if overlay_audio_clip is not None:
+                    try:
+                        overlay_audio_clip.close()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Overlay audio failed: {exc}") from exc
+
         _cb(progress_callback, 0.78, "Exporting reel — this may take a while…")
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -131,6 +160,11 @@ class VideoProcessor:
         finally:
             final.close()
             _cleanup(raw_clips, clips)
+            if overlay_audio_clip is not None:
+                try:
+                    overlay_audio_clip.close()
+                except Exception:
+                    pass
             # Belt-and-braces temp cleanup
             if os.path.exists(tmp_audio):
                 try:
