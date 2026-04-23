@@ -22,6 +22,7 @@ from tkinter import filedialog, messagebox
 from typing import List
 
 import customtkinter as ctk  # type: ignore
+from PIL import Image, ImageDraw
 
 from .analyzer import VideoAnalyzer
 from .processor import VideoProcessor
@@ -35,6 +36,12 @@ _LIST_BG   = "#2b2b3b"
 _LIST_FG   = "#cdd6f4"
 _LIST_SEL  = "#1f6aa5"
 _MONO_FONT = ("Consolas", 11)
+_PREVIEW_BG = "#151521"
+_PREVIEW_FRAME = "#232334"
+_PREVIEW_BORDER = "#55556f"
+_PREVIEW_TEXT = "#a8adc7"
+_PREVIEW_ACCENT = "#89b4fa"
+_PREVIEW_SIZE = 220
 
 
 def _group_segments_into_reels(
@@ -94,11 +101,14 @@ class AIVideoToReelApp(ctk.CTk):
         self.is_processing: bool = False
         self._stop_flag: bool = False
         self._progress_q: queue.Queue = queue.Queue()
+        self._logo_preview_image = None
 
         self.analyzer  = VideoAnalyzer()
         self.processor = VideoProcessor()
 
         self._build_ui()
+        self._bind_logo_preview_updates()
+        self._update_logo_preview()
         self._poll_queue()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -361,6 +371,87 @@ class AIVideoToReelApp(ctk.CTk):
         ).grid(row=r, column=0, sticky="w", padx=8, pady=3)
         r += 1
 
+        logo_width_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        logo_width_row.grid(row=r, column=0, sticky="ew", padx=6, pady=2)
+        logo_width_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(logo_width_row, text="Width", width=55, anchor="w").grid(
+            row=0, column=0, padx=4
+        )
+        self.logo_width_lbl = ctk.CTkLabel(logo_width_row, text="18%", width=42)
+        self.logo_width_slider = ctk.CTkSlider(
+            logo_width_row,
+            from_=5,
+            to=100,
+            number_of_steps=95,
+            command=self._on_logo_width_change,
+        )
+        self.logo_width_slider.set(18)
+        self.logo_width_slider.grid(row=0, column=1, sticky="ew", padx=4)
+        self.logo_width_lbl.grid(row=0, column=2, padx=2)
+        r += 1
+
+        logo_height_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        logo_height_row.grid(row=r, column=0, sticky="ew", padx=6, pady=2)
+        logo_height_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(logo_height_row, text="Height", width=55, anchor="w").grid(
+            row=0, column=0, padx=4
+        )
+        self.logo_height_lbl = ctk.CTkLabel(logo_height_row, text="12%", width=42)
+        self.logo_height_slider = ctk.CTkSlider(
+            logo_height_row,
+            from_=5,
+            to=100,
+            number_of_steps=95,
+            command=self._on_logo_height_change,
+        )
+        self.logo_height_slider.set(12)
+        self.logo_height_slider.grid(row=0, column=1, sticky="ew", padx=4)
+        self.logo_height_lbl.grid(row=0, column=2, padx=2)
+        r += 1
+
+        logo_opacity_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        logo_opacity_row.grid(row=r, column=0, sticky="ew", padx=6, pady=2)
+        logo_opacity_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(logo_opacity_row, text="Opacity", width=55, anchor="w").grid(
+            row=0, column=0, padx=4
+        )
+        self.logo_opacity_lbl = ctk.CTkLabel(logo_opacity_row, text="100%", width=42)
+        self.logo_opacity_slider = ctk.CTkSlider(
+            logo_opacity_row,
+            from_=10,
+            to=100,
+            number_of_steps=90,
+            command=self._on_logo_opacity_change,
+        )
+        self.logo_opacity_slider.set(100)
+        self.logo_opacity_slider.grid(row=0, column=1, sticky="ew", padx=4)
+        self.logo_opacity_lbl.grid(row=0, column=2, padx=2)
+        r += 1
+
+        preview_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        preview_row.grid(row=r, column=0, sticky="ew", padx=8, pady=(6, 2))
+        preview_row.grid_columnconfigure(0, weight=1)
+
+        self.logo_preview_lbl = ctk.CTkLabel(
+            preview_row,
+            text="",
+            width=_PREVIEW_SIZE,
+            height=_PREVIEW_SIZE,
+            fg_color="#10101a",
+            corner_radius=12,
+        )
+        self.logo_preview_lbl.grid(row=0, column=0, sticky="ew")
+
+        ctk.CTkLabel(
+            preview_row,
+            text="Live preview uses the selected output format. Original uses a 16:9 sample frame.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            wraplength=_PREVIEW_SIZE,
+        ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        r += 1
+
         # ── AI Scoring Weights ────────────────────────────────────────────────
         r = self._section(scroll, "AI Scoring Weights", r)
 
@@ -473,6 +564,161 @@ class AIVideoToReelApp(ctk.CTk):
     def _on_reel_count_change(self, v: float) -> None:
         self.reels_lbl.configure(text=f"{int(v)}")
 
+    def _on_logo_width_change(self, v: float) -> None:
+        self.logo_width_lbl.configure(text=f"{int(round(v))}%")
+        self._update_logo_preview()
+
+    def _on_logo_height_change(self, v: float) -> None:
+        self.logo_height_lbl.configure(text=f"{int(round(v))}%")
+        self._update_logo_preview()
+
+    def _on_logo_opacity_change(self, v: float) -> None:
+        self.logo_opacity_lbl.configure(text=f"{int(round(v))}%")
+        self._update_logo_preview()
+
+    def _bind_logo_preview_updates(self) -> None:
+        for var in (self.overlay_logo_var, self.logo_corner_var, self.format_var):
+            var.trace_add("write", self._schedule_logo_preview_update)
+
+    def _schedule_logo_preview_update(self, *_args) -> None:
+        self.after_idle(self._update_logo_preview)
+
+    def _update_logo_preview(self) -> None:
+        preview = self._render_logo_preview()
+        self._logo_preview_image = ctk.CTkImage(
+            light_image=preview,
+            dark_image=preview,
+            size=preview.size,
+        )
+        self.logo_preview_lbl.configure(image=self._logo_preview_image)
+
+    def _render_logo_preview(self):
+        canvas = Image.new("RGBA", (_PREVIEW_SIZE, _PREVIEW_SIZE), _PREVIEW_BG)
+        draw = ImageDraw.Draw(canvas)
+
+        frame_w, frame_h = self._preview_frame_dimensions(self.format_var.get())
+        frame_x = (_PREVIEW_SIZE - frame_w) // 2
+        frame_y = (_PREVIEW_SIZE - frame_h) // 2
+        frame_box = (frame_x, frame_y, frame_x + frame_w, frame_y + frame_h)
+
+        draw.rounded_rectangle(frame_box, radius=16, fill=_PREVIEW_FRAME, outline=_PREVIEW_BORDER, width=2)
+        draw.rounded_rectangle(
+            (frame_x + 8, frame_y + 8, frame_x + frame_w - 8, frame_y + frame_h - 8),
+            radius=12,
+            outline="#31314a",
+            width=1,
+        )
+
+        draw.text((frame_x + 12, frame_y + 12), "Video", fill=_PREVIEW_TEXT)
+
+        logo_path = self.overlay_logo_var.get().strip()
+        if not logo_path:
+            self._draw_preview_message(
+                draw,
+                frame_x,
+                frame_y,
+                frame_w,
+                frame_h,
+                "Select a logo image\nto preview placement",
+            )
+            return canvas
+
+        try:
+            logo = Image.open(logo_path).convert("RGBA")
+        except Exception:
+            self._draw_preview_message(
+                draw,
+                frame_x,
+                frame_y,
+                frame_w,
+                frame_h,
+                "Unable to load logo",
+            )
+            return canvas
+
+        logo = self._resize_preview_logo(logo, frame_w, frame_h)
+        logo = self._apply_preview_opacity(logo)
+        logo_x, logo_y = self._preview_logo_position(frame_x, frame_y, frame_w, frame_h, logo.width, logo.height)
+        canvas.alpha_composite(logo, (logo_x, logo_y))
+
+        draw.rounded_rectangle(
+            (frame_x + 10, frame_y + frame_h - 28, frame_x + 92, frame_y + frame_h - 10),
+            radius=8,
+            fill="#11111bcc",
+        )
+        draw.text((frame_x + 18, frame_y + frame_h - 25), "Logo preview", fill=_PREVIEW_ACCENT)
+        return canvas
+
+    def _preview_frame_dimensions(self, output_format: str) -> tuple[int, int]:
+        ratios = {
+            "Vertical (9:16)": (9, 16),
+            "Horizontal (16:9)": (16, 9),
+            "Square (1:1)": (1, 1),
+            "Original": (16, 9),
+        }
+        ratio_w, ratio_h = ratios.get(output_format, (9, 16))
+        available = _PREVIEW_SIZE - 20
+        scale = min(available / ratio_w, available / ratio_h)
+        return max(40, int(ratio_w * scale)), max(40, int(ratio_h * scale))
+
+    def _draw_preview_message(
+        self,
+        draw: ImageDraw.ImageDraw,
+        frame_x: int,
+        frame_y: int,
+        frame_w: int,
+        frame_h: int,
+        message: str,
+    ) -> None:
+        lines = message.splitlines()
+        total_height = len(lines) * 14
+        y = frame_y + (frame_h - total_height) // 2
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line)
+            text_w = bbox[2] - bbox[0]
+            draw.text((frame_x + (frame_w - text_w) // 2, y), line, fill=_PREVIEW_TEXT)
+            y += 14
+
+    def _resize_preview_logo(self, logo: Image.Image, frame_w: int, frame_h: int) -> Image.Image:
+        max_w = max(1, int(frame_w * (round(self.logo_width_slider.get()) / 100.0)))
+        max_h = max(1, int(frame_h * (round(self.logo_height_slider.get()) / 100.0)))
+        scale = min(max_w / logo.width, max_h / logo.height, 1.0)
+        if scale >= 1.0:
+            return logo
+
+        size = (max(1, int(logo.width * scale)), max(1, int(logo.height * scale)))
+        return logo.resize(size, Image.Resampling.LANCZOS)
+
+    def _apply_preview_opacity(self, logo: Image.Image) -> Image.Image:
+        opacity = max(0.0, min(1.0, self.logo_opacity_slider.get() / 100.0))
+        if opacity >= 1.0:
+            return logo
+
+        preview_logo = logo.copy()
+        alpha = preview_logo.getchannel("A")
+        alpha = alpha.point(lambda value: int(value * opacity))
+        preview_logo.putalpha(alpha)
+        return preview_logo
+
+    def _preview_logo_position(
+        self,
+        frame_x: int,
+        frame_y: int,
+        frame_w: int,
+        frame_h: int,
+        logo_w: int,
+        logo_h: int,
+    ) -> tuple[int, int]:
+        margin_x = max(8, int(frame_w * 0.03))
+        margin_y = max(8, int(frame_h * 0.03))
+        positions = {
+            "Top Left": (frame_x + margin_x, frame_y + margin_y),
+            "Top Right": (frame_x + frame_w - logo_w - margin_x, frame_y + margin_y),
+            "Bottom Left": (frame_x + margin_x, frame_y + frame_h - logo_h - margin_y),
+            "Bottom Right": (frame_x + frame_w - logo_w - margin_x, frame_y + frame_h - logo_h - margin_y),
+        }
+        return positions.get(self.logo_corner_var.get(), positions["Top Right"])
+
     def _add_videos(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Select Video Files",
@@ -582,6 +828,9 @@ class AIVideoToReelApp(ctk.CTk):
             "overlay_audio":  overlay_audio,
             "overlay_logo":   overlay_logo,
             "logo_corner":    self.logo_corner_var.get(),
+            "logo_width_pct": int(round(self.logo_width_slider.get())),
+            "logo_height_pct": int(round(self.logo_height_slider.get())),
+            "logo_opacity":   self.logo_opacity_slider.get() / 100.0,
             "w_motion":       self.w_motion.get(),
             "w_faces":        self.w_faces.get(),
             "w_audio":        self.w_audio.get(),
@@ -687,7 +936,9 @@ class AIVideoToReelApp(ctk.CTk):
                 )
             if cfg["overlay_logo"]:
                 self._q_log(
-                    f"🖼  Logo overlay: {Path(cfg['overlay_logo']).name} ({cfg['logo_corner']})"
+                    f"🖼  Logo overlay: {Path(cfg['overlay_logo']).name} "
+                    f"({cfg['logo_corner']}, {cfg['logo_width_pct']}%w, "
+                    f"{cfg['logo_height_pct']}%h, {int(round(cfg['logo_opacity'] * 100))}% opacity)"
                 )
 
             # ── phase 3 : assemble reels ─────────────────────────────────────
@@ -723,6 +974,9 @@ class AIVideoToReelApp(ctk.CTk):
                     overlay_audio_path=cfg["overlay_audio"] or None,
                     logo_path=cfg["overlay_logo"] or None,
                     logo_corner=cfg["logo_corner"],
+                    logo_width_pct=cfg["logo_width_pct"],
+                    logo_height_pct=cfg["logo_height_pct"],
+                    logo_opacity=cfg["logo_opacity"],
                     progress_callback=_proc_cb,
                 )
 

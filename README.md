@@ -14,7 +14,8 @@ It uses classical AI and signal-processing techniques rather than a large neural
 - Multiple export quality presets
 - Optional fade transitions
 - Optional overlay audio track for the exported reel
-- Optional logo overlay with selectable corner placement
+- Optional logo overlay with selectable corner placement, size, and opacity
+- Live preview thumbnail for logo placement and scale before export
 - AI scoring weight controls for motion, faces, and audio
 - Chronological ordering option
 
@@ -87,7 +88,7 @@ python main.py
 2. Choose the target reel duration.
 3. Choose the target clip length.
 4. Choose how many reels to generate.
-5. Set format, quality, optional overlay audio, optional logo corner overlay, and output directory.
+5. Set format, quality, optional overlay audio, optional logo corner overlay, logo size percentages, logo opacity, and output directory.
 6. Adjust AI scoring weights if needed.
 7. Click `Analyse & Create Reel`.
 

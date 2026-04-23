@@ -10,6 +10,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
+from PIL import Image
+
 
 # ── quality presets ──────────────────────────────────────────────────────────
 _QUALITY: Dict[str, Dict] = {
@@ -40,6 +42,9 @@ class VideoProcessor:
         overlay_audio_path: Optional[str] = None,
         logo_path: Optional[str] = None,
         logo_corner: str = "Top Right",
+        logo_width_pct: int = 18,
+        logo_height_pct: int = 12,
+        logo_opacity: float = 1.0,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> bool:
         """
@@ -115,6 +120,7 @@ class VideoProcessor:
 
         overlay_audio_clip = None
         logo_clip = None
+        logo_temp_path = None
         if overlay_audio_path:
             _cb(progress_callback, 0.75, "Mixing overlay audio…")
             try:
@@ -145,8 +151,15 @@ class VideoProcessor:
         if logo_path:
             _cb(progress_callback, 0.77, "Applying logo overlay…")
             try:
-                logo_clip = mp.ImageClip(str(logo_path)).set_duration(final.duration)
-                logo_clip = _resize_logo_clip(logo_clip, final.w, final.h)
+                logo_temp_path = _prepare_logo_image_asset(
+                    logo_path,
+                    final.w,
+                    final.h,
+                    logo_width_pct,
+                    logo_height_pct,
+                    logo_opacity,
+                )
+                logo_clip = mp.ImageClip(logo_temp_path).set_duration(final.duration)
                 logo_clip = logo_clip.set_position(
                     _logo_position(logo_corner, final.w, final.h, logo_clip.w, logo_clip.h)
                 )
@@ -202,6 +215,11 @@ class VideoProcessor:
                     logo_clip.close()
                 except Exception:
                     pass
+            if logo_temp_path and os.path.exists(logo_temp_path):
+                try:
+                    os.unlink(logo_temp_path)
+                except OSError:
+                    pass
             # Belt-and-braces temp cleanup
             if os.path.exists(tmp_audio):
                 try:
@@ -249,14 +267,45 @@ def _cleanup(raws: list, clips: list) -> None:
             pass
 
 
-def _resize_logo_clip(logo_clip, video_w: int, video_h: int):
-    max_w = max(48, int(video_w * 0.18))
-    max_h = max(48, int(video_h * 0.12))
+def _prepare_logo_image_asset(
+    logo_path: str,
+    video_w: int,
+    video_h: int,
+    width_pct: int,
+    height_pct: int,
+    opacity: float,
+) -> str:
+    with Image.open(logo_path) as source_logo:
+        logo = source_logo.convert("RGBA")
 
-    scale = min(max_w / logo_clip.w, max_h / logo_clip.h, 1.0)
+    width_pct = _clamp_percent(width_pct)
+    height_pct = _clamp_percent(height_pct)
+
+    max_w = max(1, int(video_w * (width_pct / 100.0)))
+    max_h = max(1, int(video_h * (height_pct / 100.0)))
+    scale = min(max_w / logo.width, max_h / logo.height, 1.0)
+
     if scale < 1.0:
-        return logo_clip.resize(scale)
-    return logo_clip
+        size = (max(1, int(logo.width * scale)), max(1, int(logo.height * scale)))
+        logo = logo.resize(size, Image.Resampling.LANCZOS)
+
+    opacity = _clamp_opacity(opacity)
+    if opacity < 1.0:
+        alpha = logo.getchannel("A")
+        alpha = alpha.point(lambda value: int(value * opacity))
+        logo.putalpha(alpha)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_logo:
+        logo.save(temp_logo.name, format="PNG")
+        return temp_logo.name
+
+
+def _clamp_percent(value: int) -> int:
+    return max(1, min(100, int(value)))
+
+
+def _clamp_opacity(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def _logo_position(corner: str, video_w: int, video_h: int, logo_w: int, logo_h: int):
