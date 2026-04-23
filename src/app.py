@@ -13,13 +13,14 @@ Layout
 import os
 import queue
 import math
+import json
 import threading
 import traceback
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import List
+from typing import Any, List
 
 import customtkinter as ctk  # type: ignore
 from PIL import Image, ImageDraw
@@ -42,6 +43,11 @@ _PREVIEW_BORDER = "#55556f"
 _PREVIEW_TEXT = "#a8adc7"
 _PREVIEW_ACCENT = "#89b4fa"
 _PREVIEW_SIZE = 220
+_SETTINGS_FILE = "settings.json"
+
+_OUTPUT_FORMATS = ["Vertical (9:16)", "Horizontal (16:9)", "Square (1:1)", "Original"]
+_QUALITY_OPTIONS = ["High (1080p)", "Medium (720p)", "Low (480p)"]
+_LOGO_CORNERS = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"]
 
 
 def _group_segments_into_reels(
@@ -53,13 +59,22 @@ def _group_segments_into_reels(
 ) -> List[List[tuple[str, dict]]]:
     reels: List[List[tuple[str, dict]]] = [[] for _ in range(requested_reels)]
     source_counts = [dict() for _ in range(requested_reels)]
+    used_segment_keys: set[tuple[str, float, float]] = set()
 
     for candidate in candidates:
+        video_path, segment = candidate
+        segment_key = (
+            video_path,
+            round(float(segment.get("start", 0.0)), 3),
+            round(float(segment.get("end", 0.0)), 3),
+        )
+        if segment_key in used_segment_keys:
+            continue
+
         available = [index for index, reel in enumerate(reels) if len(reel) < clips_per_reel]
         if not available:
             break
 
-        video_path = candidate[0]
         chosen_index = min(
             available,
             key=lambda index: (
@@ -73,11 +88,28 @@ def _group_segments_into_reels(
         source_counts[chosen_index][video_path] = (
             source_counts[chosen_index].get(video_path, 0) + 1
         )
+        used_segment_keys.add(segment_key)
 
     grouped_reels: List[List[tuple[str, dict]]] = []
+    seen_reel_signatures: set[tuple[tuple[str, float, float], ...]] = set()
     for reel_segments in reels:
         if not reel_segments:
             continue
+
+        reel_signature = tuple(
+            sorted(
+                (
+                    path,
+                    round(float(seg.get("start", 0.0)), 3),
+                    round(float(seg.get("end", 0.0)), 3),
+                )
+                for path, seg in reel_segments
+            )
+        )
+        if reel_signature in seen_reel_signatures:
+            continue
+        seen_reel_signatures.add(reel_signature)
+
         if chronological:
             reel_segments = sorted(
                 reel_segments,
@@ -102,15 +134,221 @@ class AIVideoToReelApp(ctk.CTk):
         self._stop_flag: bool = False
         self._progress_q: queue.Queue = queue.Queue()
         self._logo_preview_image = None
+        self._settings_ready = False
 
         self.analyzer  = VideoAnalyzer()
         self.processor = VideoProcessor()
 
         self._build_ui()
+        self._load_settings()
         self._bind_logo_preview_updates()
+        self._bind_settings_persistence()
         self._update_logo_preview()
+        self._settings_ready = True
         self._poll_queue()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _settings_dir(self) -> Path:
+        base_dir = os.getenv("APPDATA")
+        if base_dir:
+            return Path(base_dir) / "VideoToReel"
+        return Path.home() / ".videotoreel"
+
+    def _settings_path(self) -> Path:
+        return self._settings_dir() / _SETTINGS_FILE
+
+    def _default_settings(self) -> dict[str, Any]:
+        return {
+            "reel_duration": 30,
+            "clip_duration": 3,
+            "reel_count": 4,
+            "output_format": "Vertical (9:16)",
+            "quality": "High (1080p)",
+            "transitions": True,
+            "chronological": False,
+            "overlay_audio": "",
+            "overlay_logo": "",
+            "logo_corner": "Top Right",
+            "logo_width_pct": 10,
+            "logo_height_pct": 10,
+            "logo_opacity_pct": 45,
+            "w_motion": 0.45,
+            "w_faces": 0.35,
+            "w_audio": 0.20,
+            "output_dir": str(Path.home() / "Videos"),
+        }
+
+    def _coerce_int(self, value: Any, default: int, minimum: int, maximum: int) -> int:
+        try:
+            coerced = int(round(float(value)))
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, coerced))
+
+    def _coerce_float(self, value: Any, default: float, minimum: float, maximum: float) -> float:
+        try:
+            coerced = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, min(maximum, coerced))
+
+    def _normalized_settings(self, raw: dict[str, Any] | None) -> dict[str, Any]:
+        defaults = self._default_settings()
+        if not isinstance(raw, dict):
+            return defaults
+
+        settings = dict(defaults)
+        settings["reel_duration"] = self._coerce_int(
+            raw.get("reel_duration"), defaults["reel_duration"], 10, 120
+        )
+        settings["clip_duration"] = self._coerce_int(
+            raw.get("clip_duration"), defaults["clip_duration"], 3, 15
+        )
+        settings["reel_count"] = self._coerce_int(
+            raw.get("reel_count"), defaults["reel_count"], 1, 10
+        )
+
+        output_format = raw.get("output_format")
+        if output_format in _OUTPUT_FORMATS:
+            settings["output_format"] = output_format
+
+        quality = raw.get("quality")
+        if quality in _QUALITY_OPTIONS:
+            settings["quality"] = quality
+
+        settings["transitions"] = bool(raw.get("transitions", defaults["transitions"]))
+        settings["chronological"] = bool(raw.get("chronological", defaults["chronological"]))
+        settings["overlay_audio"] = str(raw.get("overlay_audio", defaults["overlay_audio"]) or "")
+        settings["overlay_logo"] = str(raw.get("overlay_logo", defaults["overlay_logo"]) or "")
+
+        logo_corner = raw.get("logo_corner")
+        if logo_corner in _LOGO_CORNERS:
+            settings["logo_corner"] = logo_corner
+
+        settings["logo_width_pct"] = self._coerce_int(
+            raw.get("logo_width_pct"), defaults["logo_width_pct"], 5, 100
+        )
+        settings["logo_height_pct"] = self._coerce_int(
+            raw.get("logo_height_pct"), defaults["logo_height_pct"], 5, 100
+        )
+        if "logo_opacity_pct" in raw:
+            settings["logo_opacity_pct"] = self._coerce_int(
+                raw.get("logo_opacity_pct"), defaults["logo_opacity_pct"], 10, 100
+            )
+        elif "logo_opacity" in raw:
+            settings["logo_opacity_pct"] = self._coerce_int(
+                self._coerce_float(raw.get("logo_opacity"), 1.0, 0.1, 1.0) * 100,
+                defaults["logo_opacity_pct"],
+                10,
+                100,
+            )
+
+        settings["w_motion"] = self._coerce_float(raw.get("w_motion"), defaults["w_motion"], 0.0, 1.0)
+        settings["w_faces"] = self._coerce_float(raw.get("w_faces"), defaults["w_faces"], 0.0, 1.0)
+        settings["w_audio"] = self._coerce_float(raw.get("w_audio"), defaults["w_audio"], 0.0, 1.0)
+        settings["output_dir"] = str(raw.get("output_dir", defaults["output_dir"]) or defaults["output_dir"])
+        return settings
+
+    def _collect_settings(self) -> dict[str, Any]:
+        return {
+            "reel_duration": int(round(self.dur_slider.get())),
+            "clip_duration": int(round(self.clip_slider.get())),
+            "reel_count": int(round(self.reels_slider.get())),
+            "output_format": self.format_var.get(),
+            "quality": self.quality_var.get(),
+            "transitions": self.transitions_var.get(),
+            "chronological": self.chrono_var.get(),
+            "overlay_audio": self.overlay_audio_var.get().strip(),
+            "overlay_logo": self.overlay_logo_var.get().strip(),
+            "logo_corner": self.logo_corner_var.get(),
+            "logo_width_pct": int(round(self.logo_width_slider.get())),
+            "logo_height_pct": int(round(self.logo_height_slider.get())),
+            "logo_opacity_pct": int(round(self.logo_opacity_slider.get())),
+            "w_motion": round(self.w_motion.get(), 4),
+            "w_faces": round(self.w_faces.get(), 4),
+            "w_audio": round(self.w_audio.get(), 4),
+            "output_dir": self.out_dir_var.get().strip(),
+        }
+
+    def _apply_settings(self, settings: dict[str, Any]) -> None:
+        self.dur_slider.set(settings["reel_duration"])
+        self._on_dur_change(settings["reel_duration"])
+
+        self.clip_slider.set(settings["clip_duration"])
+        self._on_clip_change(settings["clip_duration"])
+
+        self.reels_slider.set(settings["reel_count"])
+        self._on_reel_count_change(settings["reel_count"])
+
+        self.format_var.set(settings["output_format"])
+        self.quality_var.set(settings["quality"])
+        self.transitions_var.set(settings["transitions"])
+        self.chrono_var.set(settings["chronological"])
+        self.overlay_audio_var.set(settings["overlay_audio"])
+        self.overlay_logo_var.set(settings["overlay_logo"])
+        self.logo_corner_var.set(settings["logo_corner"])
+
+        self.logo_width_slider.set(settings["logo_width_pct"])
+        self._on_logo_width_change(settings["logo_width_pct"])
+
+        self.logo_height_slider.set(settings["logo_height_pct"])
+        self._on_logo_height_change(settings["logo_height_pct"])
+
+        self.logo_opacity_slider.set(settings["logo_opacity_pct"])
+        self._on_logo_opacity_change(settings["logo_opacity_pct"])
+
+        self.w_motion.set(settings["w_motion"])
+        self.w_faces.set(settings["w_faces"])
+        self.w_audio.set(settings["w_audio"])
+        self._sync_weight_labels()
+
+        self.out_dir_var.set(settings["output_dir"])
+
+    def _load_settings(self) -> None:
+        settings_path = self._settings_path()
+        try:
+            raw_settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raw_settings = None
+        except (json.JSONDecodeError, OSError):
+            raw_settings = None
+
+        self._apply_settings(self._normalized_settings(raw_settings))
+
+    def _save_settings(self) -> None:
+        if not self._settings_ready:
+            return
+
+        settings_path = self._settings_path()
+        try:
+            settings_path.parent.mkdir(parents=True, exist_ok=True)
+            settings_path.write_text(
+                json.dumps(self._collect_settings(), indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _bind_settings_persistence(self) -> None:
+        for var in (
+            self.format_var,
+            self.quality_var,
+            self.transitions_var,
+            self.chrono_var,
+            self.overlay_audio_var,
+            self.overlay_logo_var,
+            self.logo_corner_var,
+            self.out_dir_var,
+        ):
+            var.trace_add("write", self._save_settings_trace)
+
+    def _save_settings_trace(self, *_args) -> None:
+        self._save_settings()
+
+    def _sync_weight_labels(self) -> None:
+        self.w_motion_value_lbl.configure(text=f"{self.w_motion.get():.1f}")
+        self.w_faces_value_lbl.configure(text=f"{self.w_faces.get():.1f}")
+        self.w_audio_value_lbl.configure(text=f"{self.w_audio.get():.1f}")
 
     # ═══════════════════════════════════════════════════════════ UI CONSTRUCTION
 
@@ -258,10 +496,10 @@ class AIVideoToReelApp(ctk.CTk):
             clip_row, from_=3, to=15, number_of_steps=12,
             command=self._on_clip_change,
         )
-        self.clip_slider.set(5)
+        self.clip_slider.set(3)
         self.clip_slider.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-        self.clip_lbl = ctk.CTkLabel(clip_row, text="5 s", width=40, anchor="w")
+        self.clip_lbl = ctk.CTkLabel(clip_row, text="3 s", width=40, anchor="w")
         self.clip_lbl.grid(row=0, column=1)
         r += 1
 
@@ -275,10 +513,10 @@ class AIVideoToReelApp(ctk.CTk):
             reels_row, from_=1, to=10, number_of_steps=9,
             command=self._on_reel_count_change,
         )
-        self.reels_slider.set(1)
+        self.reels_slider.set(4)
         self.reels_slider.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-        self.reels_lbl = ctk.CTkLabel(reels_row, text="1", width=40, anchor="w")
+        self.reels_lbl = ctk.CTkLabel(reels_row, text="4", width=40, anchor="w")
         self.reels_lbl.grid(row=0, column=1)
         r += 1
 
@@ -287,7 +525,7 @@ class AIVideoToReelApp(ctk.CTk):
         self.format_var = ctk.StringVar(value="Vertical (9:16)")
         ctk.CTkOptionMenu(
             scroll,
-            values=["Vertical (9:16)", "Horizontal (16:9)", "Square (1:1)", "Original"],
+            values=_OUTPUT_FORMATS,
             variable=self.format_var,
             width=220,
         ).grid(row=r, column=0, sticky="w", padx=8, pady=3)
@@ -298,7 +536,7 @@ class AIVideoToReelApp(ctk.CTk):
         self.quality_var = ctk.StringVar(value="High (1080p)")
         ctk.CTkOptionMenu(
             scroll,
-            values=["High (1080p)", "Medium (720p)", "Low (480p)"],
+            values=_QUALITY_OPTIONS,
             variable=self.quality_var,
             width=220,
         ).grid(row=r, column=0, sticky="w", padx=8, pady=3)
@@ -312,7 +550,7 @@ class AIVideoToReelApp(ctk.CTk):
                       ).grid(row=r, column=0, sticky="w", padx=8, pady=2)
         r += 1
 
-        self.chrono_var = ctk.BooleanVar(value=True)
+        self.chrono_var = ctk.BooleanVar(value=False)
         ctk.CTkSwitch(scroll, text="Keep clips in chronological order",
                       variable=self.chrono_var,
                       ).grid(row=r, column=0, sticky="w", padx=8, pady=2)
@@ -365,7 +603,7 @@ class AIVideoToReelApp(ctk.CTk):
         self.logo_corner_var = ctk.StringVar(value="Top Right")
         ctk.CTkOptionMenu(
             scroll,
-            values=["Top Left", "Top Right", "Bottom Left", "Bottom Right"],
+            values=_LOGO_CORNERS,
             variable=self.logo_corner_var,
             width=220,
         ).grid(row=r, column=0, sticky="w", padx=8, pady=3)
@@ -377,7 +615,7 @@ class AIVideoToReelApp(ctk.CTk):
         ctk.CTkLabel(logo_width_row, text="Width", width=55, anchor="w").grid(
             row=0, column=0, padx=4
         )
-        self.logo_width_lbl = ctk.CTkLabel(logo_width_row, text="18%", width=42)
+        self.logo_width_lbl = ctk.CTkLabel(logo_width_row, text="10%", width=42)
         self.logo_width_slider = ctk.CTkSlider(
             logo_width_row,
             from_=5,
@@ -385,7 +623,7 @@ class AIVideoToReelApp(ctk.CTk):
             number_of_steps=95,
             command=self._on_logo_width_change,
         )
-        self.logo_width_slider.set(18)
+        self.logo_width_slider.set(10)
         self.logo_width_slider.grid(row=0, column=1, sticky="ew", padx=4)
         self.logo_width_lbl.grid(row=0, column=2, padx=2)
         r += 1
@@ -396,7 +634,7 @@ class AIVideoToReelApp(ctk.CTk):
         ctk.CTkLabel(logo_height_row, text="Height", width=55, anchor="w").grid(
             row=0, column=0, padx=4
         )
-        self.logo_height_lbl = ctk.CTkLabel(logo_height_row, text="12%", width=42)
+        self.logo_height_lbl = ctk.CTkLabel(logo_height_row, text="10%", width=42)
         self.logo_height_slider = ctk.CTkSlider(
             logo_height_row,
             from_=5,
@@ -404,7 +642,7 @@ class AIVideoToReelApp(ctk.CTk):
             number_of_steps=95,
             command=self._on_logo_height_change,
         )
-        self.logo_height_slider.set(12)
+        self.logo_height_slider.set(10)
         self.logo_height_slider.grid(row=0, column=1, sticky="ew", padx=4)
         self.logo_height_lbl.grid(row=0, column=2, padx=2)
         r += 1
@@ -415,7 +653,7 @@ class AIVideoToReelApp(ctk.CTk):
         ctk.CTkLabel(logo_opacity_row, text="Opacity", width=55, anchor="w").grid(
             row=0, column=0, padx=4
         )
-        self.logo_opacity_lbl = ctk.CTkLabel(logo_opacity_row, text="100%", width=42)
+        self.logo_opacity_lbl = ctk.CTkLabel(logo_opacity_row, text="45%", width=42)
         self.logo_opacity_slider = ctk.CTkSlider(
             logo_opacity_row,
             from_=10,
@@ -423,7 +661,7 @@ class AIVideoToReelApp(ctk.CTk):
             number_of_steps=90,
             command=self._on_logo_opacity_change,
         )
-        self.logo_opacity_slider.set(100)
+        self.logo_opacity_slider.set(45)
         self.logo_opacity_slider.grid(row=0, column=1, sticky="ew", padx=4)
         self.logo_opacity_lbl.grid(row=0, column=2, padx=2)
         r += 1
@@ -455,9 +693,9 @@ class AIVideoToReelApp(ctk.CTk):
         # ── AI Scoring Weights ────────────────────────────────────────────────
         r = self._section(scroll, "AI Scoring Weights", r)
 
-        self.w_motion, r = self._weight_row(scroll, "Motion", 0.40, r)
-        self.w_faces,  r = self._weight_row(scroll, "Faces",  0.30, r)
-        self.w_audio,  r = self._weight_row(scroll, "Audio",  0.30, r)
+        self.w_motion, self.w_motion_value_lbl, r = self._weight_row(scroll, "Motion", 0.45, r)
+        self.w_faces, self.w_faces_value_lbl, r = self._weight_row(scroll, "Faces",  0.35, r)
+        self.w_audio, self.w_audio_value_lbl, r = self._weight_row(scroll, "Audio",  0.20, r)
 
         # ── Output Directory ──────────────────────────────────────────────────
         r = self._section(scroll, "Output Directory", r)
@@ -494,12 +732,12 @@ class AIVideoToReelApp(ctk.CTk):
 
         slider = ctk.CTkSlider(
             f, from_=0, to=1,
-            command=lambda v, lbl=val_lbl: lbl.configure(text=f"{v:.1f}"),
+            command=lambda v, lbl=val_lbl: self._on_weight_change(lbl, v),
         )
         slider.set(default)
         slider.grid(row=0, column=1, sticky="ew", padx=4)
         val_lbl.grid(row=0, column=2, padx=2)
-        return slider, row + 1
+        return slider, val_lbl, row + 1
 
     # ── bottom panel ──────────────────────────────────────────────────────────
 
@@ -557,24 +795,34 @@ class AIVideoToReelApp(ctk.CTk):
 
     def _on_dur_change(self, v: float) -> None:
         self.dur_lbl.configure(text=f"{int(v)} s")
+        self._save_settings()
 
     def _on_clip_change(self, v: float) -> None:
         self.clip_lbl.configure(text=f"{int(v)} s")
+        self._save_settings()
 
     def _on_reel_count_change(self, v: float) -> None:
         self.reels_lbl.configure(text=f"{int(v)}")
+        self._save_settings()
 
     def _on_logo_width_change(self, v: float) -> None:
         self.logo_width_lbl.configure(text=f"{int(round(v))}%")
         self._update_logo_preview()
+        self._save_settings()
 
     def _on_logo_height_change(self, v: float) -> None:
         self.logo_height_lbl.configure(text=f"{int(round(v))}%")
         self._update_logo_preview()
+        self._save_settings()
 
     def _on_logo_opacity_change(self, v: float) -> None:
         self.logo_opacity_lbl.configure(text=f"{int(round(v))}%")
         self._update_logo_preview()
+        self._save_settings()
+
+    def _on_weight_change(self, label_widget, value: float) -> None:
+        label_widget.configure(text=f"{value:.1f}")
+        self._save_settings()
 
     def _bind_logo_preview_updates(self) -> None:
         for var in (self.overlay_logo_var, self.logo_corner_var, self.format_var):
@@ -836,6 +1084,8 @@ class AIVideoToReelApp(ctk.CTk):
             "w_audio":        self.w_audio.get(),
         }
 
+        self._save_settings()
+
         t = threading.Thread(
             target=self._worker, args=(list(self.video_files), settings), daemon=True
         )
@@ -1046,4 +1296,5 @@ class AIVideoToReelApp(ctk.CTk):
     def _on_close(self) -> None:
         self._stop_flag = True
         self.is_processing = False
+        self._save_settings()
         self.destroy()
