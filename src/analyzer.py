@@ -11,9 +11,11 @@ A sliding-window selection then picks the best non-overlapping
 segments from the scored timeline.
 """
 
+import os
+os.environ.setdefault("OPENCV_FFMPEG_READ_ATTEMPTS", "16384")
+
 import cv2
 import numpy as np
-import os
 import tempfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -61,12 +63,12 @@ class VideoAnalyzer:
             raise FileNotFoundError(f"Video not found: {video_path}")
 
         cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video: {video_path}")
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0 if cap.isOpened() else 25.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else 0
+        duration = (total_frames / fps) if cap.isOpened() and fps > 0 else 0.0
 
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        duration = total_frames / fps
+        if duration <= 0:
+            duration = self._probe_duration_with_moviepy(str(path))
 
         if duration < 2.0:
             cap.release()
@@ -76,8 +78,19 @@ class VideoAnalyzer:
         audio_map = self._analyze_audio(str(path))
 
         _cb(progress_callback, 0.15, "Analysing video frames…")
-        frame_scores = self._analyze_visual(cap, fps, total_frames, progress_callback)
+        frame_scores: List[Dict] = []
+
+        if cap.isOpened():
+            frame_scores = self._analyze_visual(cap, fps, total_frames, progress_callback)
         cap.release()
+
+        if self._needs_visual_fallback(frame_scores, duration):
+            reason = "retrying with ffmpeg decoder…" if frame_scores else "switching to ffmpeg decoder…"
+            _cb(progress_callback, 0.18, f"OpenCV read incomplete; {reason}")
+            frame_scores = self._analyze_visual_moviepy(str(path), progress_callback)
+
+        if not frame_scores:
+            raise ValueError(f"No usable video frames found: {video_path}")
 
         _cb(progress_callback, 0.92, "Computing final scores…")
         result = self._combine(frame_scores, audio_map)
@@ -177,6 +190,19 @@ class VideoAnalyzer:
             print(f"[Analyzer] Audio analysis skipped: {exc}")
             return {}
 
+    def _probe_duration_with_moviepy(self, video_path: str) -> float:
+        """Ask ffmpeg for duration when OpenCV metadata is missing or broken."""
+        try:
+            import moviepy.editor as mp  # type: ignore
+
+            clip = mp.VideoFileClip(video_path, audio=False)
+            try:
+                return float(clip.duration or 0.0)
+            finally:
+                clip.close()
+        except Exception:
+            return 0.0
+
     def _analyze_visual(
         self,
         cap: cv2.VideoCapture,
@@ -245,6 +271,83 @@ class VideoAnalyzer:
                 s["motion"] /= max_m
 
         return scores
+
+    def _analyze_visual_moviepy(
+        self,
+        video_path: str,
+        progress_callback: Optional[Callable],
+    ) -> List[Dict]:
+        """Fallback visual analysis using ffmpeg-backed frame iteration via moviepy."""
+        try:
+            import moviepy.editor as mp  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "moviepy is required for fallback decoding. Run: pip install moviepy==1.0.3"
+            ) from exc
+
+        sample_fps = 3.0
+        scores: List[Dict] = []
+        prev_gray: Optional[np.ndarray] = None
+
+        clip = mp.VideoFileClip(video_path, audio=False)
+        try:
+            duration = float(clip.duration or 0.0)
+            total_samples = max(1, int(duration * sample_fps))
+
+            for sample_idx, frame in enumerate(clip.iter_frames(fps=sample_fps, dtype="uint8")):
+                gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+                if prev_gray is not None and prev_gray.shape == gray.shape:
+                    diff = cv2.absdiff(prev_gray, gray)
+                    motion = float(np.mean(diff)) / 255.0
+                else:
+                    motion = 0.0
+
+                thumb_w = 320
+                scale_x = thumb_w / gray.shape[1]
+                thumb_h = max(1, int(gray.shape[0] * scale_x))
+                small = cv2.resize(gray, (thumb_w, thumb_h))
+                faces = self.face_cascade.detectMultiScale(
+                    small, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20)
+                )
+                face_score = min(len(faces) * 0.4, 1.0)
+
+                edges = cv2.Canny(gray, 50, 150)
+                complexity = float(np.mean(edges > 0))
+
+                scores.append(
+                    {
+                        "time": sample_idx / sample_fps,
+                        "motion": motion,
+                        "faces": face_score,
+                        "complexity": complexity,
+                        "audio": 0.0,
+                        "total": 0.0,
+                    }
+                )
+                prev_gray = gray
+
+                if progress_callback and sample_idx % 15 == 0:
+                    p = 0.15 + (sample_idx / total_samples) * 0.72
+                    progress_callback(p, f"Analysing frames via ffmpeg… {sample_idx}/{total_samples}")
+        finally:
+            clip.close()
+
+        if scores:
+            max_m = max(s["motion"] for s in scores) or 1.0
+            for s in scores:
+                s["motion"] /= max_m
+
+        return scores
+
+    def _needs_visual_fallback(self, frame_scores: List[Dict], duration: float) -> bool:
+        """Detect truncated OpenCV decodes and trigger a slower ffmpeg-backed retry."""
+        if not frame_scores:
+            return True
+
+        last_time = float(frame_scores[-1]["time"])
+        expected_last_time = max(0.0, duration - (1.0 / 3.0))
+        return last_time + 1.0 < expected_last_time
 
     def _combine(
         self, frames: List[Dict], audio: Dict[float, float]
