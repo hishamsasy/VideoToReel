@@ -12,7 +12,21 @@ segments from the scored timeline.
 """
 
 import os
-os.environ.setdefault("OPENCV_FFMPEG_READ_ATTEMPTS", "16384")
+
+
+def _configure_opencv_ffmpeg_attempts() -> None:
+    target_attempts = 16384
+    current_raw = os.environ.get("OPENCV_FFMPEG_READ_ATTEMPTS", "").strip()
+    try:
+        current_value = int(current_raw) if current_raw else 0
+    except ValueError:
+        current_value = 0
+
+    if current_value < target_attempts:
+        os.environ["OPENCV_FFMPEG_READ_ATTEMPTS"] = str(target_attempts)
+
+
+_configure_opencv_ffmpeg_attempts()
 
 import cv2
 import numpy as np

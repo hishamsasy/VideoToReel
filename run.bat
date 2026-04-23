@@ -10,4 +10,5 @@ if not exist "venv\Scripts\activate.bat" (
 )
 
 call venv\Scripts\activate.bat
+set OPENCV_FFMPEG_READ_ATTEMPTS=16384
 python main.py
