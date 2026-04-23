@@ -38,6 +38,8 @@ class VideoProcessor:
         quality: str = "High (1080p)",
         transitions: bool = True,
         overlay_audio_path: Optional[str] = None,
+        logo_path: Optional[str] = None,
+        logo_corner: str = "Top Right",
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> bool:
         """
@@ -112,6 +114,7 @@ class VideoProcessor:
             raise RuntimeError(f"Concatenation failed: {exc}") from exc
 
         overlay_audio_clip = None
+        logo_clip = None
         if overlay_audio_path:
             _cb(progress_callback, 0.75, "Mixing overlay audio…")
             try:
@@ -139,6 +142,35 @@ class VideoProcessor:
                         pass
                 raise RuntimeError(f"Overlay audio failed: {exc}") from exc
 
+        if logo_path:
+            _cb(progress_callback, 0.77, "Applying logo overlay…")
+            try:
+                logo_clip = mp.ImageClip(str(logo_path)).set_duration(final.duration)
+                logo_clip = _resize_logo_clip(logo_clip, final.w, final.h)
+                logo_clip = logo_clip.set_position(
+                    _logo_position(logo_corner, final.w, final.h, logo_clip.w, logo_clip.h)
+                )
+
+                composited = mp.CompositeVideoClip([final, logo_clip], size=final.size)
+                composited = composited.set_duration(final.duration)
+                if final.audio is not None:
+                    composited = composited.set_audio(final.audio)
+                final = composited
+            except Exception as exc:
+                final.close()
+                _cleanup(raw_clips, clips)
+                if overlay_audio_clip is not None:
+                    try:
+                        overlay_audio_clip.close()
+                    except Exception:
+                        pass
+                if logo_clip is not None:
+                    try:
+                        logo_clip.close()
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Logo overlay failed: {exc}") from exc
+
         _cb(progress_callback, 0.78, "Exporting reel — this may take a while…")
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -163,6 +195,11 @@ class VideoProcessor:
             if overlay_audio_clip is not None:
                 try:
                     overlay_audio_clip.close()
+                except Exception:
+                    pass
+            if logo_clip is not None:
+                try:
+                    logo_clip.close()
                 except Exception:
                     pass
             # Belt-and-braces temp cleanup
@@ -210,6 +247,29 @@ def _cleanup(raws: list, clips: list) -> None:
             obj.close()
         except Exception:
             pass
+
+
+def _resize_logo_clip(logo_clip, video_w: int, video_h: int):
+    max_w = max(48, int(video_w * 0.18))
+    max_h = max(48, int(video_h * 0.12))
+
+    scale = min(max_w / logo_clip.w, max_h / logo_clip.h, 1.0)
+    if scale < 1.0:
+        return logo_clip.resize(scale)
+    return logo_clip
+
+
+def _logo_position(corner: str, video_w: int, video_h: int, logo_w: int, logo_h: int):
+    margin_x = max(12, int(video_w * 0.03))
+    margin_y = max(12, int(video_h * 0.03))
+
+    positions = {
+        "Top Left": (margin_x, margin_y),
+        "Top Right": (video_w - logo_w - margin_x, margin_y),
+        "Bottom Left": (margin_x, video_h - logo_h - margin_y),
+        "Bottom Right": (video_w - logo_w - margin_x, video_h - logo_h - margin_y),
+    }
+    return positions.get(corner, positions["Top Right"])
 
 
 def _cb(fn: Optional[Callable], value: float, msg: str) -> None:

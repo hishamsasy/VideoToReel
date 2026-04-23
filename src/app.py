@@ -330,6 +330,37 @@ class AIVideoToReelApp(ctk.CTk):
                       ).grid(row=0, column=2)
         r += 1
 
+        # ── Logo Overlay ───────────────────────────────────────────────────
+        r = self._section(scroll, "Logo Overlay", r)
+        logo_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        logo_row.grid(row=r, column=0, sticky="ew", padx=6, pady=3)
+        logo_row.grid_columnconfigure(0, weight=1)
+
+        self.overlay_logo_var = ctk.StringVar(value="")
+        ctk.CTkEntry(
+            logo_row,
+            textvariable=self.overlay_logo_var,
+            placeholder_text="Optional PNG, JPG, JPEG, WEBP, BMP",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(logo_row, text="Browse", width=72,
+                      command=self._browse_overlay_logo,
+                      ).grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(logo_row, text="Clear", width=60,
+                      fg_color="#3a3a4a", hover_color="#4a4a5a",
+                      command=lambda: self.overlay_logo_var.set(""),
+                      ).grid(row=0, column=2)
+        r += 1
+
+        self.logo_corner_var = ctk.StringVar(value="Top Right")
+        ctk.CTkOptionMenu(
+            scroll,
+            values=["Top Left", "Top Right", "Bottom Left", "Bottom Right"],
+            variable=self.logo_corner_var,
+            width=220,
+        ).grid(row=r, column=0, sticky="w", padx=8, pady=3)
+        r += 1
+
         # ── AI Scoring Weights ────────────────────────────────────────────────
         r = self._section(scroll, "AI Scoring Weights", r)
 
@@ -491,6 +522,17 @@ class AIVideoToReelApp(ctk.CTk):
         if path:
             self.overlay_audio_var.set(path)
 
+    def _browse_overlay_logo(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Logo Image",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if path:
+            self.overlay_logo_var.set(path)
+
     # ═══════════════════════════════════════════════════════════════ PROCESSING
 
     def _start(self) -> None:
@@ -513,6 +555,14 @@ class AIVideoToReelApp(ctk.CTk):
             )
             return
 
+        overlay_logo = self.overlay_logo_var.get().strip()
+        if overlay_logo and not Path(overlay_logo).is_file():
+            messagebox.showwarning(
+                "Invalid Logo Image",
+                "Please choose a valid logo image file or clear the field.",
+            )
+            return
+
         self.is_processing = True
         self._stop_flag = False
         self.run_btn.configure(state="disabled")
@@ -530,6 +580,8 @@ class AIVideoToReelApp(ctk.CTk):
             "chronological":  self.chrono_var.get(),
             "output_dir":     out_dir,
             "overlay_audio":  overlay_audio,
+            "overlay_logo":   overlay_logo,
+            "logo_corner":    self.logo_corner_var.get(),
             "w_motion":       self.w_motion.get(),
             "w_faces":        self.w_faces.get(),
             "w_audio":        self.w_audio.get(),
@@ -633,6 +685,10 @@ class AIVideoToReelApp(ctk.CTk):
                 self._q_log(
                     f"🎵  Overlay audio: {Path(cfg['overlay_audio']).name}"
                 )
+            if cfg["overlay_logo"]:
+                self._q_log(
+                    f"🖼  Logo overlay: {Path(cfg['overlay_logo']).name} ({cfg['logo_corner']})"
+                )
 
             # ── phase 3 : assemble reels ─────────────────────────────────────
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -665,6 +721,8 @@ class AIVideoToReelApp(ctk.CTk):
                     quality=cfg["quality"],
                     transitions=cfg["transitions"],
                     overlay_audio_path=cfg["overlay_audio"] or None,
+                    logo_path=cfg["overlay_logo"] or None,
+                    logo_corner=cfg["logo_corner"],
                     progress_callback=_proc_cb,
                 )
 
