@@ -132,13 +132,19 @@ class VideoAnalyzer:
         t = 0.0
         step = 0.5
         while round(t + clip_duration, 3) <= round(max_t, 3):
-            window = [s["total"] for s in scores if t <= s["time"] < t + clip_duration]
-            if window:
+            window_samples = [s for s in scores if t <= s["time"] < t + clip_duration]
+            if window_samples:
+                refined_start, refined_end, refined_samples = self._refine_segment_window(
+                    window_samples,
+                    clip_duration,
+                    max_t,
+                    scores,
+                )
                 candidates.append(
                     {
-                        "start": round(t, 3),
-                        "end": round(t + clip_duration, 3),
-                        "score": float(np.mean(window)),
+                        "start": refined_start,
+                        "end": refined_end,
+                        "score": self._score_segment_window(refined_samples),
                     }
                 )
             t = round(t + step, 3)
@@ -161,6 +167,59 @@ class VideoAnalyzer:
 
         selected.sort(key=lambda x: x["start"])
         return selected
+
+    def _refine_segment_window(
+        self,
+        window_samples: List[Dict],
+        clip_duration: float,
+        max_t: float,
+        all_scores: List[Dict],
+    ) -> Tuple[float, float, List[Dict]]:
+        values = [float(sample["total"]) for sample in window_samples]
+        peak_index = int(np.argmax(values))
+        peak_time = float(window_samples[peak_index]["time"])
+
+        max_start = max(0.0, max_t - clip_duration)
+        refined_start = min(max(0.0, peak_time - clip_duration * 0.40), max_start)
+        refined_end = min(max_t, refined_start + clip_duration)
+        refined_start = round(refined_start, 3)
+        refined_end = round(refined_end, 3)
+
+        refined_samples = [
+            sample for sample in all_scores if refined_start <= sample["time"] < refined_end
+        ]
+        if not refined_samples:
+            refined_samples = window_samples
+            refined_start = round(float(window_samples[0]["time"]), 3)
+            refined_end = round(min(max_t, refined_start + clip_duration), 3)
+
+        return refined_start, refined_end, refined_samples
+
+    def _score_segment_window(self, window_samples: List[Dict]) -> float:
+        if not window_samples:
+            return 0.0
+
+        values = np.array([float(sample["total"]) for sample in window_samples], dtype=np.float32)
+        edge_count = max(1, min(2, len(values) // 4 or 1))
+        center_start = len(values) // 4
+        center_end = max(center_start + 1, len(values) - center_start)
+        center_values = values[center_start:center_end]
+
+        mean_score = float(np.mean(values))
+        floor_score = float(np.percentile(values, 35))
+        peak_score = float(np.max(values))
+        center_score = float(np.mean(center_values)) if len(center_values) else mean_score
+        boundary_score = float(
+            min(np.mean(values[:edge_count]), np.mean(values[-edge_count:]))
+        )
+
+        return (
+            mean_score * 0.45
+            + floor_score * 0.20
+            + center_score * 0.20
+            + peak_score * 0.10
+            + boundary_score * 0.05
+        )
 
     # --------------------------------------------------------------- internals
 

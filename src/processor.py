@@ -78,6 +78,9 @@ class VideoProcessor:
 
                 start = max(0.0, float(seg["start"]))
                 end   = min(raw.duration, float(seg["end"]))
+                frame_tail_trim = 1.0 / max(1, int(q["fps"]))
+                if end - start > frame_tail_trim * 2:
+                    end -= frame_tail_trim
                 if end - start < 0.5:
                     continue
 
@@ -97,11 +100,6 @@ class VideoProcessor:
                 if (w, h) != (clip.w, clip.h):
                     clip = clip.crop(x2=w, y2=h)
 
-                # ── fade transitions ─────────────────────────────────────────
-                if transitions and total > 1:
-                    fade = min(0.4, clip.duration / 4)
-                    clip = clip.fadein(fade).fadeout(fade)
-
                 clips.append(clip)
 
             except Exception as exc:
@@ -111,10 +109,13 @@ class VideoProcessor:
             _cleanup(raw_clips, [])
             return False
 
+        transition_overlap = 0.0
+        if transitions and len(clips) > 1:
+            transition_overlap = min(0.25, min(clip.duration for clip in clips) / 5.0)
+
         _cb(progress_callback, 0.70, "Concatenating clips…")
-        padding = -0.35 if (transitions and len(clips) > 1) else 0
         try:
-            final = mp.concatenate_videoclips(clips, method="compose", padding=padding)
+            final = _compose_clip_timeline(mp, clips, transition_overlap)
         except Exception as exc:
             _cleanup(raw_clips, clips)
             raise RuntimeError(f"Concatenation failed: {exc}") from exc
@@ -134,11 +135,7 @@ class VideoProcessor:
                     duration=final.duration,
                 ).subclip(0, final.duration)
 
-                audio_layers = [overlay_audio_clip.volumex(0.35)]
-                if final.audio is not None:
-                    audio_layers.insert(0, final.audio)
-
-                final = final.set_audio(mp.CompositeAudioClip(audio_layers))
+                final = final.set_audio(overlay_audio_clip)
             except Exception as exc:
                 final.close()
                 _cleanup(raw_clips, clips)
@@ -258,6 +255,36 @@ def _apply_ratio(clip, ratio: Tuple[int, int], target_height: int):
     final_w = final_w if final_w % 2 == 0 else final_w + 1
     final_h = final_h if final_h % 2 == 0 else final_h + 1
     return clip.resize((final_w, final_h))
+
+
+def _compose_clip_timeline(mp, clips: list, transition_overlap: float):
+    if len(clips) == 1:
+        return clips[0]
+
+    placed_clips = []
+    current_start = 0.0
+    final_size = clips[0].size
+
+    for index, clip in enumerate(clips):
+        if index == 0:
+            placed_clip = clip.set_start(0)
+            current_start = clip.duration
+        else:
+            start_time = max(0.0, current_start - transition_overlap)
+            placed_clip = clip.set_start(start_time)
+            if transition_overlap > 0:
+                placed_clip = placed_clip.crossfadein(transition_overlap)
+            current_start = start_time + clip.duration
+        placed_clips.append(placed_clip)
+
+    final = mp.CompositeVideoClip(placed_clips, size=final_size)
+    final = final.set_duration(current_start)
+
+    audio_tracks = [clip.audio for clip in placed_clips if getattr(clip, "audio", None) is not None]
+    if audio_tracks:
+        final = final.set_audio(mp.CompositeAudioClip(audio_tracks))
+
+    return final
 
 
 def _cleanup(raws: list, clips: list) -> None:
