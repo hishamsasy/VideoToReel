@@ -1126,23 +1126,72 @@ class AIVideoToReelApp(ctk.CTk):
             raise RuntimeError("yt-dlp is not installed. Run: pip install yt-dlp") from exc
 
         download_dir.mkdir(parents=True, exist_ok=True)
+
+        # yt-dlp needs a binary literally named "ffmpeg.exe" in the directory
+        # pointed to by ffmpeg_location.  The bundled imageio-ffmpeg binary is
+        # named "ffmpeg-win-x86_64-v7.1.exe", so we copy it into a temporary
+        # staging directory under the right name for the duration of the download.
+        _ff_staging_dir = None
+        try:
+            import imageio_ffmpeg  # type: ignore
+            import shutil as _shutil
+            _ff_src = imageio_ffmpeg.get_ffmpeg_exe()
+            _ff_staging_dir = str(download_dir / "_ff_stage")
+            Path(_ff_staging_dir).mkdir(parents=True, exist_ok=True)
+            _ff_dest = str(Path(_ff_staging_dir) / "ffmpeg.exe")
+            if not Path(_ff_dest).exists():
+                _shutil.copy2(_ff_src, _ff_dest)
+        except Exception:
+            _ff_staging_dir = None
+
+        # Prefer separate best-quality video+audio streams so yt-dlp is forced
+        # to merge them via ffmpeg into a proper ISO-MP4 container.
+        # Using "best[ext=mp4]" can select a raw MPEG-TS DASH stream saved with
+        # an .mp4 extension (codec tag 0x001B, 90k timebase) which causes
+        # irregular PTS values that manifest as frame-hold freezes when decoded.
+        # The merge via ffmpeg produces correct avc1/mp4a fourcc tags and a
+        # standard MP4 timebase, matching what any other site's downloader gives.
         ydl_opts = {
-            "format": "best[ext=mp4]/best",
+            "format": (
+                "bestvideo[ext=mp4][vcodec^=avc]+bestaudio[ext=m4a]"
+                "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo+bestaudio"
+                "/best[ext=mp4]/best"
+            ),
+            "merge_output_format": "mp4",
+            "postprocessor_args": {
+                # -vsync cfr normalises VFR timestamps; -movflags +faststart
+                # puts the moov atom at the front of the file.
+                "ffmpeg_i": ["-vsync", "cfr"],
+                "ffmpeg": ["-movflags", "+faststart"],
+            },
             "outtmpl": str(download_dir / "%(title).80s-%(id)s.%(ext)s"),
             "restrictfilenames": True,
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
         }
+        if _ff_staging_dir:
+            ydl_opts["ffmpeg_location"] = _ff_staging_dir
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            download_path = ydl.prepare_filename(info)
-            requested = info.get("requested_downloads")
-            if isinstance(requested, list) and requested:
-                maybe_path = requested[0].get("filepath")
-                if maybe_path:
-                    download_path = maybe_path
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                download_path = ydl.prepare_filename(info)
+                requested = info.get("requested_downloads")
+                if isinstance(requested, list) and requested:
+                    maybe_path = requested[0].get("filepath")
+                    if maybe_path:
+                        download_path = maybe_path
+        finally:
+            # Remove the staged ffmpeg.exe copy; keep the directory itself
+            # clean but don't fail if cleanup errors out.
+            if _ff_staging_dir:
+                try:
+                    import shutil as _shutil2
+                    _shutil2.rmtree(_ff_staging_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
         if not Path(download_path).is_file():
             raise RuntimeError("Download completed but output file was not found")
