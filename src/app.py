@@ -172,6 +172,7 @@ class AIVideoToReelApp(ctk.CTk):
             "logo_width_pct": 10,
             "logo_height_pct": 10,
             "logo_opacity_pct": 45,
+            "logo_margin_pct": 3,
             "w_motion": 0.45,
             "w_faces": 0.35,
             "w_audio": 0.20,
@@ -243,6 +244,10 @@ class AIVideoToReelApp(ctk.CTk):
                 100,
             )
 
+        settings["logo_margin_pct"] = self._coerce_int(
+            raw.get("logo_margin_pct"), defaults["logo_margin_pct"], 0, 20
+        )
+
         settings["w_motion"] = self._coerce_float(raw.get("w_motion"), defaults["w_motion"], 0.0, 1.0)
         settings["w_faces"] = self._coerce_float(raw.get("w_faces"), defaults["w_faces"], 0.0, 1.0)
         settings["w_audio"] = self._coerce_float(raw.get("w_audio"), defaults["w_audio"], 0.0, 1.0)
@@ -264,6 +269,7 @@ class AIVideoToReelApp(ctk.CTk):
             "logo_width_pct": int(round(self.logo_width_slider.get())),
             "logo_height_pct": int(round(self.logo_height_slider.get())),
             "logo_opacity_pct": int(round(self.logo_opacity_slider.get())),
+            "logo_margin_pct": int(round(self.logo_margin_slider.get())),
             "w_motion": round(self.w_motion.get(), 4),
             "w_faces": round(self.w_faces.get(), 4),
             "w_audio": round(self.w_audio.get(), 4),
@@ -296,6 +302,9 @@ class AIVideoToReelApp(ctk.CTk):
 
         self.logo_opacity_slider.set(settings["logo_opacity_pct"])
         self._on_logo_opacity_change(settings["logo_opacity_pct"])
+
+        self.logo_margin_slider.set(settings["logo_margin_pct"])
+        self._on_logo_margin_change(settings["logo_margin_pct"])
 
         self.w_motion.set(settings["w_motion"])
         self.w_faces.set(settings["w_faces"])
@@ -666,6 +675,25 @@ class AIVideoToReelApp(ctk.CTk):
         self.logo_opacity_lbl.grid(row=0, column=2, padx=2)
         r += 1
 
+        logo_margin_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        logo_margin_row.grid(row=r, column=0, sticky="ew", padx=6, pady=2)
+        logo_margin_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(logo_margin_row, text="Margin", width=55, anchor="w").grid(
+            row=0, column=0, padx=4
+        )
+        self.logo_margin_lbl = ctk.CTkLabel(logo_margin_row, text="3%", width=42)
+        self.logo_margin_slider = ctk.CTkSlider(
+            logo_margin_row,
+            from_=0,
+            to=20,
+            number_of_steps=20,
+            command=self._on_logo_margin_change,
+        )
+        self.logo_margin_slider.set(3)
+        self.logo_margin_slider.grid(row=0, column=1, sticky="ew", padx=4)
+        self.logo_margin_lbl.grid(row=0, column=2, padx=2)
+        r += 1
+
         preview_row = ctk.CTkFrame(scroll, fg_color="transparent")
         preview_row.grid(row=r, column=0, sticky="ew", padx=8, pady=(6, 2))
         preview_row.grid_columnconfigure(0, weight=1)
@@ -820,6 +848,11 @@ class AIVideoToReelApp(ctk.CTk):
         self._update_logo_preview()
         self._save_settings()
 
+    def _on_logo_margin_change(self, v: float) -> None:
+        self.logo_margin_lbl.configure(text=f"{int(round(v))}%")
+        self._update_logo_preview()
+        self._save_settings()
+
     def _on_weight_change(self, label_widget, value: float) -> None:
         label_widget.configure(text=f"{value:.1f}")
         self._save_settings()
@@ -957,8 +990,9 @@ class AIVideoToReelApp(ctk.CTk):
         logo_w: int,
         logo_h: int,
     ) -> tuple[int, int]:
-        margin_x = max(8, int(frame_w * 0.03))
-        margin_y = max(8, int(frame_h * 0.03))
+        margin_pct = int(round(self.logo_margin_slider.get()))
+        margin_x = int(frame_w * margin_pct / 100)
+        margin_y = int(frame_h * margin_pct / 100)
         positions = {
             "Top Left": (frame_x + margin_x, frame_y + margin_y),
             "Top Right": (frame_x + frame_w - logo_w - margin_x, frame_y + margin_y),
@@ -1079,6 +1113,7 @@ class AIVideoToReelApp(ctk.CTk):
             "logo_width_pct": int(round(self.logo_width_slider.get())),
             "logo_height_pct": int(round(self.logo_height_slider.get())),
             "logo_opacity":   self.logo_opacity_slider.get() / 100.0,
+            "logo_margin_pct": int(round(self.logo_margin_slider.get())),
             "w_motion":       self.w_motion.get(),
             "w_faces":        self.w_faces.get(),
             "w_audio":        self.w_audio.get(),
@@ -1227,6 +1262,7 @@ class AIVideoToReelApp(ctk.CTk):
                     logo_width_pct=cfg["logo_width_pct"],
                     logo_height_pct=cfg["logo_height_pct"],
                     logo_opacity=cfg["logo_opacity"],
+                    logo_margin_pct=cfg["logo_margin_pct"],
                     progress_callback=_proc_cb,
                 )
 

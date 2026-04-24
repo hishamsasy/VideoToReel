@@ -45,6 +45,7 @@ class VideoProcessor:
         logo_width_pct: int = 18,
         logo_height_pct: int = 12,
         logo_opacity: float = 1.0,
+        logo_margin_pct: int = 3,
         progress_callback: Optional[Callable[[float, str], None]] = None,
     ) -> bool:
         """
@@ -161,7 +162,7 @@ class VideoProcessor:
                 )
                 logo_clip = mp.ImageClip(logo_temp_path).set_duration(final.duration)
                 logo_clip = logo_clip.set_position(
-                    _logo_position(logo_corner, final.w, final.h, logo_clip.w, logo_clip.h)
+                    _logo_position(logo_corner, final.w, final.h, logo_clip.w, logo_clip.h, logo_margin_pct)
                 )
 
                 composited = mp.CompositeVideoClip([final, logo_clip], size=final.size)
@@ -308,9 +309,9 @@ def _clamp_opacity(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
-def _logo_position(corner: str, video_w: int, video_h: int, logo_w: int, logo_h: int):
-    margin_x = max(12, int(video_w * 0.03))
-    margin_y = max(12, int(video_h * 0.03))
+def _logo_position(corner: str, video_w: int, video_h: int, logo_w: int, logo_h: int, margin_pct: int = 3):
+    margin_x = int(video_w * margin_pct / 100)
+    margin_y = int(video_h * margin_pct / 100)
 
     positions = {
         "Top Left": (margin_x, margin_y),
