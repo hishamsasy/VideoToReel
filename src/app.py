@@ -60,6 +60,21 @@ def _is_youtube_url(value: str) -> bool:
     return any(host in raw for host in _YOUTUBE_HOSTS)
 
 
+def _estimate_visual_end(scores: List[dict[str, Any]]) -> float:
+    if not scores:
+        return 0.0
+
+    last_time = float(scores[-1].get("time", 0.0))
+    sample_step = 1.0 / 3.0
+    if len(scores) > 1:
+        prev_time = float(scores[-2].get("time", 0.0))
+        observed_gap = max(0.0, last_time - prev_time)
+        if observed_gap > 0:
+            sample_step = min(sample_step, observed_gap)
+
+    return round(last_time + sample_step, 3)
+
+
 def _group_segments_into_reels(
     candidates: List[tuple[str, dict]],
     clips_per_reel: int,
@@ -1336,8 +1351,8 @@ class AIVideoToReelApp(ctk.CTk):
                     self._q_log("  ✗ No usable frames found")
                     continue
 
-                # Get video duration via the last frame timestamp
-                video_dur = scores[-1]["time"] + clip_dur
+                # Bound selection to the last confirmed visual sample, not container duration.
+                video_dur = _estimate_visual_end(scores)
 
                 # Grab extra candidates so the global ranking has material to work with
                 cands = self.analyzer.get_best_segments(
@@ -1348,7 +1363,9 @@ class AIVideoToReelApp(ctk.CTk):
                 )
                 self._q_log(f"  → {len(cands)} candidate segments found")
                 for seg in cands:
-                    all_candidates.append((path, seg))
+                    segment = dict(seg)
+                    segment["source_visual_end"] = video_dur
+                    all_candidates.append((path, segment))
 
             if not all_candidates:
                 self._q_log("❌  No segments found across any video.")

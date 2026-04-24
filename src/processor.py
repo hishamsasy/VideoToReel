@@ -76,9 +76,20 @@ class VideoProcessor:
                 raw = mp.VideoFileClip(str(video_path))
                 raw_clips.append(raw)
 
-                start = max(0.0, float(seg["start"]))
-                end   = min(raw.duration, float(seg["end"]))
-                frame_tail_trim = 1.0 / max(1, int(q["fps"]))
+                raw_duration = max(0.0, _float_or_default(raw.duration, 0.0))
+                start = max(0.0, _float_or_default(seg.get("start"), 0.0))
+
+                source_visual_end = _float_or_default(seg.get("source_visual_end"), raw_duration)
+                source_end_limit = raw_duration
+                if source_visual_end > 0:
+                    source_end_limit = min(raw_duration, source_visual_end) if raw_duration > 0 else source_visual_end
+
+                end = min(source_end_limit, _float_or_default(seg.get("end"), source_end_limit))
+                source_fps = _detect_clip_fps(raw, q["fps"])
+                frame_tail_trim = max(
+                    1.0 / max(1.0, source_fps),
+                    1.0 / max(1, int(q["fps"])),
+                )
                 if end - start > frame_tail_trim * 2:
                     end -= frame_tail_trim
                 if end - start < 0.5:
@@ -99,6 +110,12 @@ class VideoProcessor:
                 h = clip.h if clip.h % 2 == 0 else clip.h - 1
                 if (w, h) != (clip.w, clip.h):
                     clip = clip.crop(x2=w, y2=h)
+
+                # Normalise fps to output fps so CompositeVideoClip has a
+                # consistent frame-rate context and doesn't hold frames when
+                # sources mix 24/29.97/60 fps originals.
+                if not getattr(clip, "fps", None) or clip.fps <= 0:
+                    clip = clip.set_fps(q["fps"])
 
                 clips.append(clip)
 
@@ -261,28 +278,56 @@ def _compose_clip_timeline(mp, clips: list, transition_overlap: float):
     if len(clips) == 1:
         return clips[0]
 
+    # ── no-transition path ────────────────────────────────────────────────────
+    # concatenate_videoclips uses numpy cumsum for frame-precise start times and
+    # is the correct moviepy API for sequential clips.  CompositeVideoClip with
+    # manually accumulated float offsets can leave a sub-frame gap at each
+    # boundary that the compositor fills with a black frame, producing a
+    # visible flash/freeze.
+    if transition_overlap <= 0.0:
+        return mp.concatenate_videoclips(clips, method="compose")
+
+    # ── transition path (crossfade) ──────────────────────────────────────────
     placed_clips = []
     current_start = 0.0
     final_size = clips[0].size
 
     for index, clip in enumerate(clips):
-        if index == 0:
-            placed_clip = clip.set_start(0)
-            current_start = clip.duration
-        else:
-            start_time = max(0.0, current_start - transition_overlap)
-            placed_clip = clip.set_start(start_time)
-            if transition_overlap > 0:
+        is_first = index == 0
+        is_last  = index == len(clips) - 1
+
+        start_time = 0.0 if is_first else max(0.0, current_start - transition_overlap)
+        placed_clip = clip.copy().set_start(start_time)
+
+        if transition_overlap > 0:
+            # Video crossfade: only fade IN the incoming clip.
+            # CompositeVideoClip alpha-blends the incoming clip (alpha 0→1) over the
+            # outgoing clip, which stays at full opacity — no double-black dip.
+            # Adding crossfadeout to the outgoing clip would cause both to approach
+            # zero brightness at the same time, producing the "long pause" dip.
+            if not is_first:
                 placed_clip = placed_clip.crossfadein(transition_overlap)
-            current_start = start_time + clip.duration
+
+            # Audio crossfade: fade out the tail of outgoing clips and fade in the
+            # head of incoming clips independently (crossfade{in,out} don't touch audio).
+            if placed_clip.audio is not None:
+                faded_audio = placed_clip.audio
+                if not is_first:
+                    faded_audio = faded_audio.audio_fadein(transition_overlap)
+                if not is_last:
+                    faded_audio = faded_audio.audio_fadeout(transition_overlap)
+                placed_clip = placed_clip.set_audio(faded_audio)
+
+        current_start = start_time + clip.duration
         placed_clips.append(placed_clip)
 
     final = mp.CompositeVideoClip(placed_clips, size=final_size)
     final = final.set_duration(current_start)
 
-    audio_tracks = [clip.audio for clip in placed_clips if getattr(clip, "audio", None) is not None]
+    audio_tracks = [c.audio for c in placed_clips if getattr(c, "audio", None) is not None]
     if audio_tracks:
-        final = final.set_audio(mp.CompositeAudioClip(audio_tracks))
+        comp_audio = mp.CompositeAudioClip(audio_tracks).set_duration(current_start)
+        final = final.set_audio(comp_audio)
 
     return final
 
@@ -293,6 +338,27 @@ def _cleanup(raws: list, clips: list) -> None:
             obj.close()
         except Exception:
             pass
+
+
+def _float_or_default(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _detect_clip_fps(clip, fallback_fps: float) -> float:
+    fps = _float_or_default(getattr(clip, "fps", None), 0.0)
+    if fps > 0:
+        return fps
+
+    reader = getattr(clip, "reader", None)
+    if reader is not None:
+        fps = _float_or_default(getattr(reader, "fps", None), 0.0)
+        if fps > 0:
+            return fps
+
+    return max(1.0, _float_or_default(fallback_fps, 30.0))
 
 
 def _prepare_logo_image_asset(
