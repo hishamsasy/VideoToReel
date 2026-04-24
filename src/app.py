@@ -20,7 +20,7 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
-from typing import Any, List
+from typing import Any, List, Optional
 
 import customtkinter as ctk  # type: ignore
 from PIL import Image, ImageDraw
@@ -130,6 +130,7 @@ class AIVideoToReelApp(ctk.CTk):
         self.configure(fg_color=_DARK_BG)
 
         self.video_files: List[str] = []
+        self.overlay_audio_files: List[str] = []
         self.is_processing: bool = False
         self._stop_flag: bool = False
         self._progress_q: queue.Queue = queue.Queue()
@@ -166,7 +167,7 @@ class AIVideoToReelApp(ctk.CTk):
             "quality": "High (1080p)",
             "transitions": True,
             "chronological": False,
-            "overlay_audio": "",
+            "overlay_audio": [],
             "overlay_logo": "",
             "logo_corner": "Top Right",
             "logo_width_pct": 10,
@@ -219,7 +220,13 @@ class AIVideoToReelApp(ctk.CTk):
 
         settings["transitions"] = bool(raw.get("transitions", defaults["transitions"]))
         settings["chronological"] = bool(raw.get("chronological", defaults["chronological"]))
-        settings["overlay_audio"] = str(raw.get("overlay_audio", defaults["overlay_audio"]) or "")
+        raw_audio = raw.get("overlay_audio", [])
+        if isinstance(raw_audio, str):
+            settings["overlay_audio"] = [raw_audio] if raw_audio.strip() else []
+        elif isinstance(raw_audio, list):
+            settings["overlay_audio"] = [str(p) for p in raw_audio if p and str(p).strip()]
+        else:
+            settings["overlay_audio"] = []
         settings["overlay_logo"] = str(raw.get("overlay_logo", defaults["overlay_logo"]) or "")
 
         logo_corner = raw.get("logo_corner")
@@ -263,7 +270,7 @@ class AIVideoToReelApp(ctk.CTk):
             "quality": self.quality_var.get(),
             "transitions": self.transitions_var.get(),
             "chronological": self.chrono_var.get(),
-            "overlay_audio": self.overlay_audio_var.get().strip(),
+            "overlay_audio": list(self.overlay_audio_files),
             "overlay_logo": self.overlay_logo_var.get().strip(),
             "logo_corner": self.logo_corner_var.get(),
             "logo_width_pct": int(round(self.logo_width_slider.get())),
@@ -290,7 +297,8 @@ class AIVideoToReelApp(ctk.CTk):
         self.quality_var.set(settings["quality"])
         self.transitions_var.set(settings["transitions"])
         self.chrono_var.set(settings["chronological"])
-        self.overlay_audio_var.set(settings["overlay_audio"])
+        self.overlay_audio_files = list(settings["overlay_audio"])
+        self._update_audio_label()
         self.overlay_logo_var.set(settings["overlay_logo"])
         self.logo_corner_var.set(settings["logo_corner"])
 
@@ -344,7 +352,6 @@ class AIVideoToReelApp(ctk.CTk):
             self.quality_var,
             self.transitions_var,
             self.chrono_var,
-            self.overlay_audio_var,
             self.overlay_logo_var,
             self.logo_corner_var,
             self.out_dir_var,
@@ -565,26 +572,39 @@ class AIVideoToReelApp(ctk.CTk):
                       ).grid(row=r, column=0, sticky="w", padx=8, pady=2)
         r += 1
 
-        # ── Overlay Audio Track ─────────────────────────────────────────────
-        r = self._section(scroll, "Overlay Audio Track", r)
+        # ── Overlay Audio Tracks (one per reel, each reel gets a unique track) ─
+        r = self._section(scroll, "Overlay Audio Tracks", r)
         audio_row = ctk.CTkFrame(scroll, fg_color="transparent")
         audio_row.grid(row=r, column=0, sticky="ew", padx=6, pady=3)
         audio_row.grid_columnconfigure(0, weight=1)
 
-        self.overlay_audio_var = ctk.StringVar(value="")
-        ctk.CTkEntry(
+        self.overlay_audio_lbl = ctk.CTkLabel(
             audio_row,
-            textvariable=self.overlay_audio_var,
-            placeholder_text="Optional MP3, WAV, M4A, AAC, FLAC, OGG",
+            text="No audio selected",
+            text_color="gray55",
             font=ctk.CTkFont(size=11),
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ctk.CTkButton(audio_row, text="Browse", width=72,
+            anchor="w",
+        )
+        self.overlay_audio_lbl.grid(row=0, column=0, sticky="ew", padx=(4, 6))
+        ctk.CTkButton(audio_row, text="Add", width=60,
                       command=self._browse_overlay_audio,
                       ).grid(row=0, column=1, padx=(0, 6))
         ctk.CTkButton(audio_row, text="Clear", width=60,
                       fg_color="#3a3a4a", hover_color="#4a4a5a",
-                      command=lambda: self.overlay_audio_var.set(""),
+                      command=self._clear_overlay_audio,
                       ).grid(row=0, column=2)
+        r += 1
+
+        ctk.CTkLabel(
+            scroll,
+            text="Add one track per reel for unique audio on every reel.\n"
+                 "If fewer tracks than reels, tracks cycle round-robin.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            wraplength=260,
+            anchor="w",
+        ).grid(row=r, column=0, sticky="w", padx=8, pady=(0, 4))
         r += 1
 
         # ── Logo Overlay ───────────────────────────────────────────────────
@@ -1040,15 +1060,38 @@ class AIVideoToReelApp(ctk.CTk):
             self.out_dir_var.set(d)
 
     def _browse_overlay_audio(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select Overlay Audio Track",
+        paths = filedialog.askopenfilenames(
+            title="Select Overlay Audio Track(s)",
             filetypes=[
                 ("Audio Files", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
                 ("All Files", "*.*"),
             ],
         )
-        if path:
-            self.overlay_audio_var.set(path)
+        if paths:
+            for p in paths:
+                if p not in self.overlay_audio_files:
+                    self.overlay_audio_files.append(p)
+            self._update_audio_label()
+            self._save_settings()
+
+    def _clear_overlay_audio(self) -> None:
+        self.overlay_audio_files = []
+        self._update_audio_label()
+        self._save_settings()
+
+    def _update_audio_label(self) -> None:
+        n = len(self.overlay_audio_files)
+        if n == 0:
+            self.overlay_audio_lbl.configure(text="No audio selected", text_color="gray55")
+        elif n == 1:
+            name = Path(self.overlay_audio_files[0]).name
+            self.overlay_audio_lbl.configure(
+                text=f"1 track: {name}", text_color=_LIST_FG
+            )
+        else:
+            self.overlay_audio_lbl.configure(
+                text=f"{n} tracks selected  (cycles 1 per reel)", text_color=_LIST_FG
+            )
 
     def _browse_overlay_logo(self) -> None:
         path = filedialog.askopenfilename(
@@ -1075,11 +1118,13 @@ class AIVideoToReelApp(ctk.CTk):
             return
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
-        overlay_audio = self.overlay_audio_var.get().strip()
-        if overlay_audio and not Path(overlay_audio).is_file():
+        overlay_audio_files = [p for p in self.overlay_audio_files if p.strip()]
+        invalid_audio = [p for p in overlay_audio_files if not Path(p).is_file()]
+        if invalid_audio:
             messagebox.showwarning(
                 "Invalid Audio Track",
-                "Please choose a valid overlay audio file or clear the field.",
+                f"{len(invalid_audio)} audio file(s) could not be found.\n"
+                "Please re-add them or clear the audio selection.",
             )
             return
 
@@ -1107,7 +1152,7 @@ class AIVideoToReelApp(ctk.CTk):
             "transitions":    self.transitions_var.get(),
             "chronological":  self.chrono_var.get(),
             "output_dir":     out_dir,
-            "overlay_audio":  overlay_audio,
+            "overlay_audio_files": overlay_audio_files,
             "overlay_logo":   overlay_logo,
             "logo_corner":    self.logo_corner_var.get(),
             "logo_width_pct": int(round(self.logo_width_slider.get())),
@@ -1215,9 +1260,11 @@ class AIVideoToReelApp(ctk.CTk):
                 f"\n✓  Selected {total_segments} clips across {len(reels)} reel(s) "
                 f"(~{total_segments * clip_dur} s total)"
             )
-            if cfg["overlay_audio"]:
+            audio_files = cfg.get("overlay_audio_files", [])
+            if audio_files:
+                cycle_note = "cycling" if len(audio_files) < len(reels) else "one per reel"
                 self._q_log(
-                    f"🎵  Overlay audio: {Path(cfg['overlay_audio']).name}"
+                    f"🎵  {len(audio_files)} audio track(s) loaded  ({cycle_note})"
                 )
             if cfg["overlay_logo"]:
                 self._q_log(
@@ -1235,10 +1282,23 @@ class AIVideoToReelApp(ctk.CTk):
                     self._q_log("⚠  Cancelled.")
                     return
 
+                # Assign a unique audio track per reel (cycle if fewer tracks than reels)
+                reel_audio: Optional[str] = (
+                    audio_files[(reel_index - 1) % len(audio_files)]
+                    if audio_files else None
+                )
+
                 suffix = f"_{reel_index:02d}" if len(reels) > 1 else ""
                 out_path = Path(cfg["output_dir"]) / f"reel_{ts}{suffix}.mp4"
+
+                avg_score = sum(seg["score"] for _, seg in reel_segments) / len(reel_segments)
+                quality_note = ""
+                if avg_score < 0.20:
+                    quality_note = "  ⚠ low-scoring clips"
+                audio_note = f"  🎵 {Path(reel_audio).name}" if reel_audio else ""
                 self._q_log(
-                    f"🎬  Creating {out_path.name} with {len(reel_segments)} clip(s)…"
+                    f"🎬  Creating {out_path.name} — {len(reel_segments)} clip(s), "
+                    f"avg. score {avg_score:.2f}{quality_note}{audio_note}"
                 )
 
                 progress_start = 0.70 + ((reel_index - 1) / len(reels)) * 0.29
@@ -1256,7 +1316,7 @@ class AIVideoToReelApp(ctk.CTk):
                     output_format=cfg["output_format"],
                     quality=cfg["quality"],
                     transitions=cfg["transitions"],
-                    overlay_audio_path=cfg["overlay_audio"] or None,
+                    overlay_audio_path=reel_audio,
                     logo_path=cfg["overlay_logo"] or None,
                     logo_corner=cfg["logo_corner"],
                     logo_width_pct=cfg["logo_width_pct"],
