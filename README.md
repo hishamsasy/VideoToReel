@@ -8,6 +8,7 @@ It uses classical AI and signal-processing techniques rather than a large neural
 
 - Desktop UI built with CustomTkinter
 - Import multiple source videos in one run
+- Add YouTube video URLs as input sources (downloaded automatically)
 - Generate one or more reels from the same source set
 - Adjustable reel duration and clip length
 - Vertical, horizontal, square, or original output formats
@@ -85,12 +86,13 @@ python main.py
 ## Usage
 
 1. Add one or more video files.
-2. Choose the target reel duration.
-3. Choose the target clip length.
-4. Choose how many reels to generate.
-5. Set format, quality, optional overlay audio, optional logo corner overlay, logo size percentages, logo opacity, and output directory.
-6. Adjust AI scoring weights if needed.
-7. Click `Analyse & Create Reel`.
+2. Optional: add one or more YouTube links as sources.
+3. Choose the target reel duration.
+4. Choose the target clip length.
+5. Choose how many reels to generate.
+6. Set format, quality, optional overlay audio, optional logo corner overlay, logo size percentages, logo opacity, and output directory.
+7. Adjust AI scoring weights if needed.
+8. Click `Analyse & Create Reel`.
 
 Generated files are written to the selected output folder and use names like:
 
@@ -114,6 +116,7 @@ reel_20260423_143500_02.mp4
 ## Notes and Limitations
 
 - This project does not use a deep learning model or cloud AI service.
+- YouTube source download requires internet access and `yt-dlp`.
 - Face detection relies on OpenCV's Haar cascade classifier.
 - Very long videos can take time to analyze because the app processes both frames and audio locally.
 - Reel quality depends on the amount of strong source material available.

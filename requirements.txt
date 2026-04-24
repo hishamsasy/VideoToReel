@@ -8,3 +8,4 @@ scipy>=1.11.0
 soundfile>=0.12.1
 imageio-ffmpeg>=0.4.9
 imageio>=2.31.1
+yt-dlp>=2025.1.0

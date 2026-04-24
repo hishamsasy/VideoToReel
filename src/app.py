@@ -19,7 +19,7 @@ import traceback
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from typing import Any, List, Optional
 
 import customtkinter as ctk  # type: ignore
@@ -48,6 +48,16 @@ _SETTINGS_FILE = "settings.json"
 _OUTPUT_FORMATS = ["Vertical (9:16)", "Horizontal (16:9)", "Square (1:1)", "Original"]
 _QUALITY_OPTIONS = ["High (1080p)", "Medium (720p)", "Low (480p)"]
 _LOGO_CORNERS = ["Top Left", "Top Right", "Bottom Left", "Bottom Right"]
+_YOUTUBE_HOSTS = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be")
+
+
+def _is_youtube_url(value: str) -> bool:
+    raw = value.strip().lower()
+    if not raw:
+        return False
+    if not (raw.startswith("http://") or raw.startswith("https://")):
+        return False
+    return any(host in raw for host in _YOUTUBE_HOSTS)
 
 
 def _group_segments_into_reels(
@@ -440,8 +450,8 @@ class AIVideoToReelApp(ctk.CTk):
         # placeholder label that sits in the centre when the list is empty
         self._placeholder = tk.Label(
             lb_frame,
-            text="Click  '+ Add Videos'  to get started\n\n"
-                 "Supported: MP4  MOV  AVI  MKV  WMV  FLV  M4V  WEBM",
+              text="Click  '+ Add Files'  or  '+ Add YouTube'  to get started\n\n"
+                  "Supported files: MP4  MOV  AVI  MKV  WMV  FLV  M4V  WEBM",
             bg=_LIST_BG, fg="#555570",
             font=("Segoe UI", 11),
             justify="center",
@@ -451,19 +461,22 @@ class AIVideoToReelApp(ctk.CTk):
         # ── buttons ───────────────────────────────────────────────────────────
         btn = ctk.CTkFrame(frame, fg_color="transparent")
         btn.grid(row=2, column=0, sticky="ew", padx=10, pady=(4, 10))
-        btn.grid_columnconfigure((0, 1, 2), weight=1)
+        btn.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        ctk.CTkButton(btn, text="+ Add Videos",
+        ctk.CTkButton(btn, text="+ Add Files",
                       height=34, command=self._add_videos
                       ).grid(row=0, column=0, padx=3, sticky="ew")
+        ctk.CTkButton(btn, text="+ Add YouTube",
+                  height=34, command=self._add_youtube_link
+                  ).grid(row=0, column=1, padx=3, sticky="ew")
         ctk.CTkButton(btn, text="Remove Selected",
                       height=34, fg_color="#3a3a4a", hover_color="#4a4a5a",
                       command=self._remove_selected
-                      ).grid(row=0, column=1, padx=3, sticky="ew")
+                  ).grid(row=0, column=2, padx=3, sticky="ew")
         ctk.CTkButton(btn, text="Clear All",
                       height=34, fg_color="#3a3a4a", hover_color="#4a4a5a",
                       command=self._clear_files
-                      ).grid(row=0, column=2, padx=3, sticky="ew")
+                  ).grid(row=0, column=3, padx=3, sticky="ew")
 
     # ── settings panel ────────────────────────────────────────────────────────
 
@@ -1034,6 +1047,37 @@ class AIVideoToReelApp(ctk.CTk):
                 self.video_files.append(p)
         self._refresh_list()
 
+    def _add_youtube_link(self) -> None:
+        value = simpledialog.askstring(
+            "Add YouTube Link",
+            "Paste one or more YouTube URLs (comma or newline separated):",
+            parent=self,
+        )
+        if not value:
+            return
+
+        parts = [piece.strip() for piece in value.replace("\n", ",").split(",")]
+        added = 0
+        invalid = 0
+        for item in parts:
+            if not item:
+                continue
+            if not _is_youtube_url(item):
+                invalid += 1
+                continue
+            if item not in self.video_files:
+                self.video_files.append(item)
+                added += 1
+
+        self._refresh_list()
+        if invalid:
+            messagebox.showwarning(
+                "Some Links Ignored",
+                f"{invalid} item(s) were not valid YouTube links and were skipped.",
+            )
+        if added:
+            self._log(f"🔗  Added {added} YouTube link(s) to source list")
+
     def _remove_selected(self) -> None:
         sel = list(self.file_lb.curselection())
         for i in reversed(sel):
@@ -1049,10 +1093,45 @@ class AIVideoToReelApp(ctk.CTk):
         if self.video_files:
             self._placeholder.place_forget()
             for i, p in enumerate(self.video_files, 1):
-                size_mb = os.path.getsize(p) / 1_048_576
-                self.file_lb.insert(tk.END, f"  {i}.  {Path(p).name}  ({size_mb:.1f} MB)")
+                if _is_youtube_url(p):
+                    self.file_lb.insert(tk.END, f"  {i}.  [YouTube] {p}")
+                else:
+                    try:
+                        size_mb = os.path.getsize(p) / 1_048_576
+                        self.file_lb.insert(tk.END, f"  {i}.  {Path(p).name}  ({size_mb:.1f} MB)")
+                    except OSError:
+                        self.file_lb.insert(tk.END, f"  {i}.  {Path(p).name}  (missing)")
         else:
             self._placeholder.place(relx=0.5, rely=0.45, anchor="center")
+
+    def _download_youtube_video(self, url: str, download_dir: Path) -> str:
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("yt-dlp is not installed. Run: pip install yt-dlp") from exc
+
+        download_dir.mkdir(parents=True, exist_ok=True)
+        ydl_opts = {
+            "format": "best[ext=mp4]/best",
+            "outtmpl": str(download_dir / "%(title).80s-%(id)s.%(ext)s"),
+            "restrictfilenames": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            download_path = ydl.prepare_filename(info)
+            requested = info.get("requested_downloads")
+            if isinstance(requested, list) and requested:
+                maybe_path = requested[0].get("filepath")
+                if maybe_path:
+                    download_path = maybe_path
+
+        if not Path(download_path).is_file():
+            raise RuntimeError("Download completed but output file was not found")
+        return download_path
 
     def _browse_output(self) -> None:
         d = filedialog.askdirectory(title="Select Output Directory")
@@ -1109,6 +1188,17 @@ class AIVideoToReelApp(ctk.CTk):
     def _start(self) -> None:
         if not self.video_files:
             messagebox.showwarning("No Videos", "Please add at least one video file.")
+            return
+
+        invalid_sources = [
+            p for p in self.video_files if (not _is_youtube_url(p) and not Path(p).is_file())
+        ]
+        if invalid_sources:
+            messagebox.showwarning(
+                "Invalid Source",
+                f"{len(invalid_sources)} local source file(s) could not be found.\n"
+                "Please re-add them or remove them from the list.",
+            )
             return
 
         out_dir = self.out_dir_var.get().strip()
@@ -1180,6 +1270,38 @@ class AIVideoToReelApp(ctk.CTk):
         try:
             self._q_progress(0.01, "Configuring analyser…")
             self.analyzer.set_weights(cfg["w_motion"], cfg["w_faces"], cfg["w_audio"])
+
+            resolved_files: List[str] = []
+            youtube_sources = [source for source in files if _is_youtube_url(source)]
+            download_dir = Path(cfg["output_dir"]) / "_downloads"
+
+            if youtube_sources:
+                self._q_log(f"⬇  Downloading {len(youtube_sources)} YouTube source(s)…")
+
+            for i, source in enumerate(files, start=1):
+                if self._stop_flag:
+                    self._q_log("⚠  Cancelled.")
+                    return
+
+                if _is_youtube_url(source):
+                    self._q_progress(
+                        0.01 + (i / max(1, len(files))) * 0.08,
+                        f"Downloading source {i}/{len(files)}…",
+                    )
+                    try:
+                        downloaded = self._download_youtube_video(source, download_dir)
+                        resolved_files.append(downloaded)
+                        self._q_log(f"  ✓ Downloaded: {Path(downloaded).name}")
+                    except Exception as exc:
+                        self._q_log(f"  ✗ Failed to download URL {source}: {exc}")
+                else:
+                    resolved_files.append(source)
+
+            files = resolved_files
+            if not files:
+                self._q_log("❌  No usable input sources after download step.")
+                self._q_progress(0, "Failed — no usable sources")
+                return
 
             clip_dur = max(3, cfg["clip_duration"])
             clips_per_reel = max(1, math.ceil(cfg["reel_duration"] / clip_dur))

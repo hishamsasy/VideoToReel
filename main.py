@@ -17,6 +17,7 @@ def _check_deps() -> list[str]:
         "numpy":         "numpy",
         "PIL":           "Pillow",
         "soundfile":     "soundfile",
+        "yt_dlp":        "yt-dlp",
     }
     missing = []
     for mod, pip_name in packages.items():
