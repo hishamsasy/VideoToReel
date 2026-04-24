@@ -323,7 +323,7 @@ class AIVideoToReelApp(ctk.CTk):
         self.transitions_var.set(settings["transitions"])
         self.chrono_var.set(settings["chronological"])
         self.overlay_audio_files = list(settings["overlay_audio"])
-        self._update_audio_label()
+        self._refresh_audio_list()
         self.overlay_logo_var.set(settings["overlay_logo"])
         self.logo_corner_var.set(settings["logo_corner"])
 
@@ -600,33 +600,74 @@ class AIVideoToReelApp(ctk.CTk):
                       ).grid(row=r, column=0, sticky="w", padx=8, pady=2)
         r += 1
 
-        # ── Overlay Audio Tracks (one per reel, each reel gets a unique track) ─
+        # ── Overlay Audio Tracks ──────────────────────────────────────────────
         r = self._section(scroll, "Overlay Audio Tracks", r)
-        audio_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        audio_row.grid(row=r, column=0, sticky="ew", padx=6, pady=3)
-        audio_row.grid_columnconfigure(0, weight=1)
 
-        self.overlay_audio_lbl = ctk.CTkLabel(
-            audio_row,
-            text="No audio selected",
-            text_color="gray55",
-            font=ctk.CTkFont(size=11),
-            anchor="w",
+        # Button row: Add File | + YouTube | Remove | Clear
+        audio_btn_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        audio_btn_row.grid(row=r, column=0, sticky="ew", padx=6, pady=(2, 2))
+        for _col in range(4):
+            audio_btn_row.grid_columnconfigure(_col, weight=1)
+        ctk.CTkButton(
+            audio_btn_row, text="+ File", height=28,
+            command=self._browse_overlay_audio,
+        ).grid(row=0, column=0, padx=(0, 2), sticky="ew")
+        ctk.CTkButton(
+            audio_btn_row, text="+ YouTube", height=28,
+            command=self._add_youtube_audio,
+        ).grid(row=0, column=1, padx=2, sticky="ew")
+        ctk.CTkButton(
+            audio_btn_row, text="Remove", height=28,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            command=self._remove_audio_selected,
+        ).grid(row=0, column=2, padx=2, sticky="ew")
+        ctk.CTkButton(
+            audio_btn_row, text="Clear All", height=28,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            command=self._clear_overlay_audio,
+        ).grid(row=0, column=3, padx=(2, 0), sticky="ew")
+        r += 1
+
+        # Audio track listbox
+        audio_lb_frame = tk.Frame(
+            scroll, bg=_LIST_BG, bd=0,
+            highlightthickness=1, highlightbackground="#444",
         )
-        self.overlay_audio_lbl.grid(row=0, column=0, sticky="ew", padx=(4, 6))
-        ctk.CTkButton(audio_row, text="Add", width=60,
-                      command=self._browse_overlay_audio,
-                      ).grid(row=0, column=1, padx=(0, 6))
-        ctk.CTkButton(audio_row, text="Clear", width=60,
-                      fg_color="#3a3a4a", hover_color="#4a4a5a",
-                      command=self._clear_overlay_audio,
-                      ).grid(row=0, column=2)
+        audio_lb_frame.grid(row=r, column=0, sticky="ew", padx=6, pady=2)
+        audio_lb_frame.grid_rowconfigure(0, weight=1)
+        audio_lb_frame.grid_columnconfigure(0, weight=1)
+
+        self.audio_lb = tk.Listbox(
+            audio_lb_frame,
+            selectmode=tk.SINGLE,
+            bg=_LIST_BG, fg=_LIST_FG,
+            selectbackground=_LIST_SEL, selectforeground="white",
+            font=_MONO_FONT,
+            bd=0, highlightthickness=0,
+            activestyle="none",
+            relief="flat",
+            height=4,
+        )
+        self.audio_lb.grid(row=0, column=0, sticky="nsew")
+
+        audio_sb = ctk.CTkScrollbar(audio_lb_frame, command=self.audio_lb.yview)
+        audio_sb.grid(row=0, column=1, sticky="ns")
+        self.audio_lb.configure(yscrollcommand=audio_sb.set)
+
+        self._audio_placeholder = tk.Label(
+            audio_lb_frame,
+            text="No audio tracks — add a file or YouTube URL",
+            bg=_LIST_BG, fg="#555570",
+            font=("Segoe UI", 10),
+        )
+        self._audio_placeholder.place(relx=0.5, rely=0.5, anchor="center")
         r += 1
 
         ctk.CTkLabel(
             scroll,
-            text="Add one track per reel for unique audio on every reel.\n"
-                 "If fewer tracks than reels, tracks cycle round-robin.",
+            text="One track per reel — each reel gets unique audio.\n"
+                 "YouTube URLs: audio is extracted automatically.\n"
+                 "Fewer tracks than reels? They cycle round-robin.",
             font=ctk.CTkFont(size=10),
             text_color="gray55",
             justify="left",
@@ -879,6 +920,7 @@ class AIVideoToReelApp(ctk.CTk):
 
     def _on_reel_count_change(self, v: float) -> None:
         self.reels_lbl.configure(text=f"{int(v)}")
+        self._refresh_audio_list()
         self._save_settings()
 
     def _on_logo_width_change(self, v: float) -> None:
@@ -1214,27 +1256,168 @@ class AIVideoToReelApp(ctk.CTk):
             for p in paths:
                 if p not in self.overlay_audio_files:
                     self.overlay_audio_files.append(p)
-            self._update_audio_label()
+            self._refresh_audio_list()
             self._save_settings()
 
     def _clear_overlay_audio(self) -> None:
         self.overlay_audio_files = []
-        self._update_audio_label()
+        self._refresh_audio_list()
         self._save_settings()
 
-    def _update_audio_label(self) -> None:
+    def _refresh_audio_list(self) -> None:
+        if not hasattr(self, "audio_lb"):
+            return
+        self.audio_lb.delete(0, tk.END)
         n = len(self.overlay_audio_files)
         if n == 0:
-            self.overlay_audio_lbl.configure(text="No audio selected", text_color="gray55")
-        elif n == 1:
-            name = Path(self.overlay_audio_files[0]).name
-            self.overlay_audio_lbl.configure(
-                text=f"1 track: {name}", text_color=_LIST_FG
+            self._audio_placeholder.place(relx=0.5, rely=0.5, anchor="center")
+            return
+        self._audio_placeholder.place_forget()
+        reel_count = int(round(self.reels_slider.get())) if hasattr(self, "reels_slider") else 1
+        for i, p in enumerate(self.overlay_audio_files):
+            reel_idx = (i % reel_count) + 1
+            if _is_youtube_url(p):
+                short = (p[:44] + "…") if len(p) > 45 else p
+                label = f"  {i + 1}. [YT] {short}"
+            else:
+                label = f"  {i + 1}. {Path(p).name}"
+            self.audio_lb.insert(tk.END, f"{label}  → Reel {reel_idx}")
+
+    def _add_youtube_audio(self) -> None:
+        dlg = ctk.CTkToplevel(self)
+        dlg.title("Add YouTube Audio Tracks")
+        dlg.geometry("540x340")
+        dlg.resizable(True, True)
+        dlg.grab_set()
+        dlg.configure(fg_color=_DARK_BG)
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            dlg,
+            text="Paste YouTube URLs — one per line.\nAudio will be extracted automatically when reels are created.",
+            font=ctk.CTkFont(size=12),
+            text_color="gray65",
+            justify="left",
+        ).grid(row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+
+        txt = ctk.CTkTextbox(dlg, font=ctk.CTkFont(family="Consolas", size=12))
+        txt.grid(row=1, column=0, sticky="nsew", padx=14, pady=4)
+
+        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row.grid(row=2, column=0, sticky="e", padx=14, pady=(6, 14))
+
+        result: list[str] = []
+
+        def _ok() -> None:
+            raw = txt.get("1.0", "end")
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            invalid = [ln for ln in lines if not _is_youtube_url(ln)]
+            valid   = [ln for ln in lines if _is_youtube_url(ln)]
+            if invalid and not valid:
+                messagebox.showwarning(
+                    "No Valid URLs",
+                    f"None of the {len(invalid)} line(s) are valid YouTube URLs.",
+                    parent=dlg,
+                )
+                return
+            result.extend(valid)
+            dlg.grab_release()
+            dlg.destroy()
+
+        ctk.CTkButton(btn_row, text="Cancel", width=90,
+                      fg_color="#3a3a4a", hover_color="#4a4a5a",
+                      command=lambda: (dlg.grab_release(), dlg.destroy()),
+                      ).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_row, text="Add Tracks", width=110,
+                      command=_ok,
+                      ).pack(side="left")
+
+        dlg.bind("<Control-Return>", lambda _e: _ok())
+        self.wait_window(dlg)
+
+        if not result:
+            return
+
+        added = 0
+        for url in result:
+            if url not in self.overlay_audio_files:
+                self.overlay_audio_files.append(url)
+                added += 1
+        if added:
+            self._refresh_audio_list()
+            self._save_settings()
+            self._log(f"🎵  Added {added} YouTube audio track(s)")
+
+    def _remove_audio_selected(self) -> None:
+        sel = list(self.audio_lb.curselection())
+        for i in reversed(sel):
+            if 0 <= i < len(self.overlay_audio_files):
+                self.overlay_audio_files.pop(i)
+        self._refresh_audio_list()
+        self._save_settings()
+
+    def _download_youtube_audio(self, url: str, download_dir: Path) -> str:
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("yt-dlp is not installed. Run: pip install yt-dlp") from exc
+
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        _ff_staging_dir = None
+        try:
+            import imageio_ffmpeg  # type: ignore
+            import shutil as _shutil
+            _ff_src = imageio_ffmpeg.get_ffmpeg_exe()
+            _ff_staging_dir = str(download_dir / "_ff_stage_audio")
+            Path(_ff_staging_dir).mkdir(parents=True, exist_ok=True)
+            _ff_dest = str(Path(_ff_staging_dir) / "ffmpeg.exe")
+            if not Path(_ff_dest).exists():
+                _shutil.copy2(_ff_src, _ff_dest)
+        except Exception:
+            _ff_staging_dir = None
+
+        ydl_opts: dict = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+            "outtmpl": str(download_dir / "audio-%(title).60s-%(id)s.%(ext)s"),
+            "restrictfilenames": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+        if _ff_staging_dir:
+            ydl_opts["ffmpeg_location"] = _ff_staging_dir
+
+        mp3_path = ""
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                # After FFmpegExtractAudio the extension becomes .mp3
+                mp3_path = str(Path(ydl.prepare_filename(info)).with_suffix(".mp3"))
+                requested = info.get("requested_downloads")
+                if isinstance(requested, list) and requested:
+                    maybe_path = requested[0].get("filepath")
+                    if maybe_path:
+                        mp3_path = maybe_path
+        finally:
+            if _ff_staging_dir:
+                try:
+                    import shutil as _shutil2
+                    _shutil2.rmtree(_ff_staging_dir, ignore_errors=True)
+                except Exception:
+                    pass
+
+        if not Path(mp3_path).is_file():
+            raise RuntimeError(
+                f"Audio extraction completed but output file was not found: {mp3_path}"
             )
-        else:
-            self.overlay_audio_lbl.configure(
-                text=f"{n} tracks selected  (cycles 1 per reel)", text_color=_LIST_FG
-            )
+        return mp3_path
 
     def _browse_overlay_logo(self) -> None:
         path = filedialog.askopenfilename(
@@ -1273,7 +1456,10 @@ class AIVideoToReelApp(ctk.CTk):
         Path(out_dir).mkdir(parents=True, exist_ok=True)
 
         overlay_audio_files = [p for p in self.overlay_audio_files if p.strip()]
-        invalid_audio = [p for p in overlay_audio_files if not Path(p).is_file()]
+        invalid_audio = [
+            p for p in overlay_audio_files
+            if not _is_youtube_url(p) and not Path(p).is_file()
+        ]
         if invalid_audio:
             messagebox.showwarning(
                 "Invalid Audio Track",
@@ -1449,10 +1635,34 @@ class AIVideoToReelApp(ctk.CTk):
                 f"(~{total_segments * clip_dur} s total)"
             )
             audio_files = cfg.get("overlay_audio_files", [])
+
+            # ── phase 2.5 : resolve YouTube audio sources ────────────────────
+            yt_audio_urls = [p for p in audio_files if _is_youtube_url(p)]
+            if yt_audio_urls:
+                self._q_log(f"🎵  Downloading {len(yt_audio_urls)} YouTube audio track(s)…")
+                audio_download_dir = Path(cfg["output_dir"]) / "_audio_downloads"
+                resolved_audio: List[str] = []
+                for p in audio_files:
+                    if self._stop_flag:
+                        self._q_log("⚠  Cancelled.")
+                        return
+                    if _is_youtube_url(p):
+                        short_url = (p[:60] + "…") if len(p) > 61 else p
+                        self._q_progress(0.69, f"Extracting audio: {short_url}")
+                        try:
+                            dl_audio = self._download_youtube_audio(p, audio_download_dir)
+                            resolved_audio.append(dl_audio)
+                            self._q_log(f"  ✓ Audio ready: {Path(dl_audio).name}")
+                        except Exception as exc:
+                            self._q_log(f"  ✗ Audio download failed: {exc}")
+                    else:
+                        resolved_audio.append(p)
+                audio_files = resolved_audio
+
             if audio_files:
                 cycle_note = "cycling" if len(audio_files) < len(reels) else "one per reel"
                 self._q_log(
-                    f"🎵  {len(audio_files)} audio track(s) loaded  ({cycle_note})"
+                    f"🎵  {len(audio_files)} audio track(s) ready  ({cycle_note})"
                 )
             if cfg["overlay_logo"]:
                 self._q_log(
