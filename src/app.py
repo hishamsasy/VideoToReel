@@ -3227,7 +3227,10 @@ class AIVideoToReelApp(ctk.CTk):
         self._local_prog_lbl.configure(text="Starting local pipeline...")
 
         self._local_log("Starting Local Colorization Pipeline")
-        self._local_log("Stack: DDColor -> ColorMNet -> Real-ESRGAN -> Deflicker")
+        if ref_image:
+            self._local_log("Stack: Reference -> ColorMNet -> Real-ESRGAN -> Chroma Deflicker")
+        else:
+            self._local_log("Stack: DDColor seed -> ColorMNet -> Real-ESRGAN -> Chroma Deflicker")
         self._local_log(f"Input : {input_path}")
         self._local_log(f"Output: {output_path}")
         try:

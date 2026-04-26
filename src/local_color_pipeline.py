@@ -2,10 +2,10 @@
 Local video colorization pipeline.
 
 Stack:
-  1) DDColor (per-frame colorization)
-  2) ColorMNet (temporal consistency)
+  1) ColorMNet with a supplied reference image, or DDColor seed if no reference exists
+  2) ColorMNet temporal propagation
   3) Real-ESRGAN (optional upscale + denoise)
-  4) Lightweight temporal deflicker (optional)
+  4) Lightweight chroma deflicker (optional)
 
 This module is intentionally lazy-imported by the UI tab so the main app can start
 without these heavy optional dependencies installed.
@@ -188,7 +188,7 @@ def rebuild_video(frames_dir: str, output_path: str, fps: float, audio_source: O
     cmd = [
         ffmpeg_exe, "-y", "-framerate", str(fps),
         "-i", pattern,
-        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+        "-c:v", "libx264", "-crf", "16", "-preset", "slow",
         "-pix_fmt", "yuv420p", tmp_video,
     ]
     subprocess.run(cmd, check=True)
@@ -310,11 +310,12 @@ def run_ddcolor(
 
 def run_colormnet(
     grayscale_frames_dir: str,
-    colorized_frames_dir: str,
+    colorized_frames_dir: Optional[str],
     out_dir: str,
     reference_image_path: Optional[str] = None,
     memory_mode: str = "balanced",
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    log_callback: Optional[Callable[[str], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     half: bool = True,
 ) -> None:
@@ -346,7 +347,7 @@ def run_colormnet(
 
     ckpt_path = _ensure_colormnet_checkpoint(project_root)
 
-    mem_every = 15 if memory_mode == "low_memory" else 5 if memory_mode == "high_quality" else 10
+    mem_every = 15 if memory_mode == "low_memory" else 3 if memory_mode == "high_quality" else 5
 
     config = {
         "mem_every": mem_every,
@@ -368,10 +369,10 @@ def run_colormnet(
     network.eval()
 
     gray_frames = sorted(Path(grayscale_frames_dir).glob("*.png"))
-    color_frames = sorted(Path(colorized_frames_dir).glob("*.png"))
+    color_frames = sorted(Path(colorized_frames_dir).glob("*.png")) if colorized_frames_dir else []
     if len(gray_frames) == 0:
         raise RuntimeError("No grayscale frames for ColorMNet")
-    if len(gray_frames) != len(color_frames):
+    if reference_image_path is None and len(gray_frames) != len(color_frames):
         raise RuntimeError("ColorMNet input mismatch between grayscale and colorized frame counts")
 
     total = len(gray_frames)
@@ -402,7 +403,44 @@ def run_colormnet(
             image = image.resize(size, Image.BILINEAR)
         return lab_transform(image)
 
-    for i, (gray_fp, color_fp) in enumerate(zip(gray_frames, color_frames), start=1):
+    def _log(message: str) -> None:
+        if log_callback:
+            log_callback(message)
+
+    def _reference_alignment_score(frame_path: str, ref_path: str, size: tuple[int, int]) -> float:
+        import cv2
+
+        frame = np.asarray(Image.open(frame_path).convert("L").resize(size, Image.BILINEAR), dtype=np.float32)
+        ref = np.asarray(Image.open(ref_path).convert("L").resize(size, Image.BILINEAR), dtype=np.float32)
+
+        frame = cv2.GaussianBlur(frame, (5, 5), 0)
+        ref = cv2.GaussianBlur(ref, (5, 5), 0)
+        frame_grad_x = cv2.Sobel(frame, cv2.CV_32F, 1, 0, ksize=3)
+        frame_grad_y = cv2.Sobel(frame, cv2.CV_32F, 0, 1, ksize=3)
+        ref_grad_x = cv2.Sobel(ref, cv2.CV_32F, 1, 0, ksize=3)
+        ref_grad_y = cv2.Sobel(ref, cv2.CV_32F, 0, 1, ksize=3)
+        frame_edges = np.hypot(frame_grad_x, frame_grad_y).reshape(-1)
+        ref_edges = np.hypot(ref_grad_x, ref_grad_y).reshape(-1)
+
+        frame_edges -= float(frame_edges.mean())
+        ref_edges -= float(ref_edges.mean())
+        denom = float(np.linalg.norm(frame_edges) * np.linalg.norm(ref_edges))
+        if denom <= 1e-6:
+            return 0.0
+        return float(np.dot(frame_edges, ref_edges) / denom)
+
+    reference_is_first_frame = False
+    if reference_image_path:
+        with Image.open(gray_frames[0]) as first_frame:
+            score_size = (min(first_frame.width, 512), min(first_frame.height, 512))
+        ref_score = _reference_alignment_score(str(gray_frames[0]), reference_image_path, score_size)
+        reference_is_first_frame = ref_score >= 0.72
+        if reference_is_first_frame:
+            _log(f"Reference image matches the first frame (edge score {ref_score:.3f}); using it as the color anchor.")
+        else:
+            _log(f"Reference image differs from the first frame (edge score {ref_score:.3f}); using any-exemplar transfer.")
+
+    for i, gray_fp in enumerate(gray_frames, start=1):
         _check_cancel(stop_check)
 
         gray_lab = _to_lab_tensor(str(gray_fp))
@@ -415,12 +453,19 @@ def run_colormnet(
         if i == 1:
             if reference_image_path:
                 ref_lab = _to_lab_tensor(reference_image_path, size=(gray_lab.shape[2], gray_lab.shape[1]))
-                step_kwargs.update({
-                    "msk_lll": _move_tensor(ref_lab[:1, :, :].repeat(3, 1, 1)),
-                    "msk_ab": _move_tensor(ref_lab[1:3, :, :]),
-                    "flag_FirstframeIsExemplar": False,
-                })
+                if reference_is_first_frame:
+                    step_kwargs.update({
+                        "msk_ab": _move_tensor(ref_lab[1:3, :, :]),
+                        "flag_FirstframeIsExemplar": True,
+                    })
+                else:
+                    step_kwargs.update({
+                        "msk_lll": _move_tensor(ref_lab[:1, :, :].repeat(3, 1, 1)),
+                        "msk_ab": _move_tensor(ref_lab[1:3, :, :]),
+                        "flag_FirstframeIsExemplar": False,
+                    })
             else:
+                color_fp = color_frames[i - 1]
                 first_color_lab = _to_lab_tensor(str(color_fp), size=(gray_lab.shape[2], gray_lab.shape[1]))
                 step_kwargs.update({
                     "msk_ab": _move_tensor(first_color_lab[1:3, :, :]),
@@ -538,7 +583,7 @@ def run_fastblend_deflicker(
     frames_dir: str,
     out_dir: str,
     window: int = 3,
-    blend_strength: float = 0.5,
+    blend_strength: float = 0.35,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
 ) -> None:
@@ -551,18 +596,19 @@ def run_fastblend_deflicker(
     if total == 0:
         raise RuntimeError("No frames found for deflicker")
 
-    buf = []
+    ab_buf = []
     for i, fp in enumerate(frames, start=1):
         _check_cancel(stop_check)
-        img = cv2.imread(str(fp)).astype(np.float32)
-        buf.append(img)
-        if len(buf) > window:
-            buf.pop(0)
+        img = cv2.imread(str(fp), cv2.IMREAD_COLOR)
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        ab_buf.append(lab[:, :, 1:3].copy())
+        if len(ab_buf) > window:
+            ab_buf.pop(0)
 
-        weights = np.array([blend_strength ** (len(buf) - 1 - j) for j in range(len(buf))])
+        weights = np.array([blend_strength ** (len(ab_buf) - 1 - j) for j in range(len(ab_buf))])
         weights /= weights.sum()
-        blended = sum(w * f for w, f in zip(weights, buf))
-        blended = np.clip(blended, 0, 255).astype(np.uint8)
+        lab[:, :, 1:3] = sum(w * f for w, f in zip(weights, ab_buf))
+        blended = cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
         cv2.imwrite(os.path.join(out_dir, fp.name), blended)
 
         if i % 10 == 0 or i == total:
@@ -651,27 +697,37 @@ def run_local_colorization_pipeline(
         _log(f"Output: {output_video}")
         _log(f"Device: {device_label}")
         _log(f"Upscale x{upscale} | memory_mode={memory_mode} | half={half}")
+        if reference_image:
+            if effective_skip_colormnet:
+                _log("Reference image selected, but ColorMNet is unavailable/skipped; DDColor cannot use references.")
+            else:
+                _log(f"Reference: {reference_image}")
 
         fps = extract_frames(input_video, steps["raw"], progress_callback=progress_callback, stop_check=stop_check)
 
-        _log("Running DDColor")
-        run_ddcolor(
-            steps["raw"],
-            steps["ddcolor"],
-            progress_callback=progress_callback,
-            stop_check=stop_check,
-            half=half,
-        )
+        needs_ddcolor = effective_skip_colormnet or not reference_image
+        if needs_ddcolor:
+            _log("Running DDColor")
+            run_ddcolor(
+                steps["raw"],
+                steps["ddcolor"],
+                progress_callback=progress_callback,
+                stop_check=stop_check,
+                half=half,
+            )
+        else:
+            _log("Skipping DDColor because ColorMNet will use the supplied reference image directly")
 
         if not effective_skip_colormnet:
             _log("Running ColorMNet")
             run_colormnet(
                 grayscale_frames_dir=steps["raw"],
-                colorized_frames_dir=steps["ddcolor"],
+                colorized_frames_dir=steps["ddcolor"] if needs_ddcolor else None,
                 out_dir=steps["colormnet"],
                 reference_image_path=reference_image,
                 memory_mode=memory_mode,
                 progress_callback=progress_callback,
+                log_callback=_log,
                 stop_check=stop_check,
                 half=half,
             )
