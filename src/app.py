@@ -23,9 +23,11 @@ from tkinter import filedialog, messagebox, simpledialog
 from typing import Any, List, Optional
 
 import customtkinter as ctk  # type: ignore
+import cv2  # type: ignore
 from PIL import Image, ImageDraw
 
 from .analyzer import VideoAnalyzer
+from .enhancer import VideoEnhancer
 from .processor import VideoProcessor
 
 # ── appearance ────────────────────────────────────────────────────────────────
@@ -162,8 +164,18 @@ class AIVideoToReelApp(ctk.CTk):
         self._logo_preview_image = None
         self._settings_ready = False
 
+        self._dl_items: List[dict] = []
+        self._dl_stop_flag: bool = False
+        self._dl_is_running: bool = False
+        self._dl_queue: queue.Queue = queue.Queue()
+
+        self._enh_is_running: bool = False
+        self._enh_stop_flag: bool = False
+        self._enh_queue: queue.Queue = queue.Queue()
+
         self.analyzer  = VideoAnalyzer()
         self.processor = VideoProcessor()
+        self.enhancer  = VideoEnhancer()
 
         self._build_ui()
         self._load_settings()
@@ -172,6 +184,8 @@ class AIVideoToReelApp(ctk.CTk):
         self._update_logo_preview()
         self._settings_ready = True
         self._poll_queue()
+        self._poll_dl_queue()
+        self._poll_enh_queue()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _settings_dir(self) -> Path:
@@ -394,22 +408,28 @@ class AIVideoToReelApp(ctk.CTk):
     # ═══════════════════════════════════════════════════════════ UI CONSTRUCTION
 
     def _build_ui(self) -> None:
-        self.grid_columnconfigure(0, weight=3)
-        self.grid_columnconfigure(1, weight=2)
+        self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(2, weight=0)
 
         self._build_header()
-        self._build_file_panel()
-        self._build_settings_panel()
-        self._build_bottom_panel()
+
+        self._tab_view = ctk.CTkTabview(self, fg_color="transparent", corner_radius=10)
+        self._tab_view.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
+
+        self._tab_view.add("\U0001f3ac  Reel Creator")
+        self._tab_view.add("\u2b07  Batch Downloader")
+        self._tab_view.add("\u2728  Enhance & Colorise")
+
+        self._build_reel_tab(self._tab_view.tab("\U0001f3ac  Reel Creator"))
+        self._build_downloader_tab(self._tab_view.tab("\u2b07  Batch Downloader"))
+        self._build_enhance_tab(self._tab_view.tab("\u2728  Enhance & Colorise"))
 
     # ── header ────────────────────────────────────────────────────────────────
 
     def _build_header(self) -> None:
         hdr = ctk.CTkFrame(self, height=64, corner_radius=0,
                            fg_color=("gray80", "#181825"))
-        hdr.grid(row=0, column=0, columnspan=2, sticky="ew")
+        hdr.grid(row=0, column=0, sticky="ew")
         hdr.grid_propagate(False)
         hdr.grid_columnconfigure(1, weight=1)
 
@@ -425,11 +445,22 @@ class AIVideoToReelApp(ctk.CTk):
             text_color="gray55",
         ).grid(row=0, column=1, padx=20, pady=14, sticky="e")
 
+    # ── reel creator tab ─────────────────────────────────────────────────────
+
+    def _build_reel_tab(self, parent: ctk.CTkFrame) -> None:
+        parent.grid_columnconfigure(0, weight=3)
+        parent.grid_columnconfigure(1, weight=2)
+        parent.grid_rowconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=0)
+        self._build_file_panel(parent)
+        self._build_settings_panel(parent)
+        self._build_bottom_panel(parent)
+
     # ── file panel ────────────────────────────────────────────────────────────
 
-    def _build_file_panel(self) -> None:
-        frame = ctk.CTkFrame(self, corner_radius=10)
-        frame.grid(row=1, column=0, sticky="nsew", padx=(10, 5), pady=8)
+    def _build_file_panel(self, parent: ctk.CTkFrame) -> None:
+        frame = ctk.CTkFrame(parent, corner_radius=10)
+        frame.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=4)
         frame.grid_rowconfigure(1, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
@@ -495,9 +526,9 @@ class AIVideoToReelApp(ctk.CTk):
 
     # ── settings panel ────────────────────────────────────────────────────────
 
-    def _build_settings_panel(self) -> None:
-        frame = ctk.CTkFrame(self, corner_radius=10)
-        frame.grid(row=1, column=1, sticky="nsew", padx=(5, 10), pady=8)
+    def _build_settings_panel(self, parent: ctk.CTkFrame) -> None:
+        frame = ctk.CTkFrame(parent, corner_radius=10)
+        frame.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=4)
         frame.grid_rowconfigure(1, weight=1)
         frame.grid_columnconfigure(0, weight=1)
 
@@ -830,6 +861,415 @@ class AIVideoToReelApp(ctk.CTk):
                       ).grid(row=0, column=1)
         r += 1
 
+    # ── batch downloader tab ──────────────────────────────────────────────────
+
+    def _build_downloader_tab(self, parent: ctk.CTkFrame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(4, weight=1)
+
+        # ── URL row ───────────────────────────────────────────────────────────
+        url_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        url_frame.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        url_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(url_frame, text="Channel / Search URL:",
+                     width=160, anchor="w",
+                     ).grid(row=0, column=0, padx=(0, 6))
+        self._dl_url_var = ctk.StringVar()
+        ctk.CTkEntry(
+            url_frame, textvariable=self._dl_url_var,
+            placeholder_text="https://www.youtube.com/@channel/search?query=…",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            url_frame, text="Clear", width=60,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            command=lambda: self._dl_url_var.set(""),
+        ).grid(row=0, column=2)
+
+        # ── Output dir row ────────────────────────────────────────────────────
+        out_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        out_frame.grid(row=1, column=0, sticky="ew", padx=8, pady=4)
+        out_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(out_frame, text="Save To:",
+                     width=160, anchor="w",
+                     ).grid(row=0, column=0, padx=(0, 6))
+        self._dl_out_var = ctk.StringVar(value=str(Path.home() / "Videos" / "Downloads"))
+        ctk.CTkEntry(out_frame, textvariable=self._dl_out_var,
+                     font=ctk.CTkFont(size=11),
+                     ).grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(out_frame, text="Browse", width=72,
+                      command=self._dl_browse_out,
+                      ).grid(row=0, column=2)
+
+        # ── Actions row ───────────────────────────────────────────────────────
+        act_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        act_frame.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
+        act_frame.grid_columnconfigure(1, weight=1)
+
+        limit_inner = ctk.CTkFrame(act_frame, fg_color="transparent")
+        limit_inner.grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(limit_inner, text="Max videos:", anchor="w",
+                     ).grid(row=0, column=0, padx=(0, 6))
+        self._dl_limit_var = ctk.StringVar(value="50")
+        ctk.CTkEntry(limit_inner, textvariable=self._dl_limit_var,
+                     width=60, font=ctk.CTkFont(size=11), justify="center",
+                     ).grid(row=0, column=1)
+
+        btn_inner = ctk.CTkFrame(act_frame, fg_color="transparent")
+        btn_inner.grid(row=0, column=2, sticky="e")
+
+        ctk.CTkButton(btn_inner, text="\U0001f50d  Fetch List", width=120,
+                      command=self._dl_fetch,
+                      ).pack(side="left", padx=(0, 6))
+        self._dl_download_btn = ctk.CTkButton(
+            btn_inner, text="\u2b07  Download All", width=130,
+            state="disabled", command=self._dl_start,
+        )
+        self._dl_download_btn.pack(side="left", padx=(0, 6))
+        self._dl_cancel_btn = ctk.CTkButton(
+            btn_inner, text="Cancel", width=80,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            state="disabled", command=self._dl_cancel,
+        )
+        self._dl_cancel_btn.pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btn_inner, text="Open Folder", width=100,
+                      fg_color="#3a3a4a", hover_color="#4a4a5a",
+                      command=self._dl_open_folder,
+                      ).pack(side="left")
+
+        # ── Progress ──────────────────────────────────────────────────────────
+        prog_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        prog_frame.grid(row=3, column=0, sticky="ew", padx=8, pady=(2, 2))
+        prog_frame.grid_columnconfigure(0, weight=1)
+
+        self._dl_prog_bar = ctk.CTkProgressBar(prog_frame)
+        self._dl_prog_bar.set(0)
+        self._dl_prog_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self._dl_prog_lbl = ctk.CTkLabel(
+            prog_frame, text="Ready", width=260,
+            font=ctk.CTkFont(size=11), anchor="w",
+        )
+        self._dl_prog_lbl.grid(row=0, column=1)
+
+        # ── Video list ────────────────────────────────────────────────────────
+        list_outer = ctk.CTkFrame(parent, corner_radius=8)
+        list_outer.grid(row=4, column=0, sticky="nsew", padx=8, pady=(2, 4))
+        list_outer.grid_rowconfigure(0, weight=1)
+        list_outer.grid_columnconfigure(0, weight=1)
+
+        lb_frame = tk.Frame(list_outer, bg=_LIST_BG, bd=0,
+                            highlightthickness=1, highlightbackground="#444")
+        lb_frame.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        lb_frame.grid_rowconfigure(0, weight=1)
+        lb_frame.grid_columnconfigure(0, weight=1)
+
+        self._dl_lb = tk.Listbox(
+            lb_frame,
+            selectmode=tk.EXTENDED,
+            bg=_LIST_BG, fg=_LIST_FG,
+            selectbackground=_LIST_SEL, selectforeground="white",
+            font=_MONO_FONT,
+            bd=0, highlightthickness=0,
+            activestyle="none",
+            relief="flat",
+        )
+        self._dl_lb.grid(row=0, column=0, sticky="nsew")
+
+        dl_sb = ctk.CTkScrollbar(lb_frame, command=self._dl_lb.yview)
+        dl_sb.grid(row=0, column=1, sticky="ns")
+        self._dl_lb.configure(yscrollcommand=dl_sb.set)
+
+        self._dl_placeholder = tk.Label(
+            lb_frame,
+            text="Enter a YouTube channel or search URL above\n"
+                 "then click  '\U0001f50d Fetch List'  to see available videos",
+            bg=_LIST_BG, fg="#555570",
+            font=("Segoe UI", 11),
+            justify="center",
+        )
+        self._dl_placeholder.place(relx=0.5, rely=0.45, anchor="center")
+
+        # ── Log ───────────────────────────────────────────────────────────────
+        self._dl_log_box = ctk.CTkTextbox(
+            parent, font=ctk.CTkFont(size=11, family="Consolas"),
+            height=90, state="disabled",
+        )
+        self._dl_log_box.grid(row=5, column=0, sticky="ew", padx=8, pady=(2, 8))
+
+    # ═══════════════════════════════════════════ BATCH DOWNLOADER CALLBACKS
+
+    def _dl_fetch(self) -> None:
+        url = self._dl_url_var.get().strip()
+        if not url:
+            messagebox.showwarning("No URL",
+                                   "Please enter a YouTube channel or search URL.",
+                                   parent=self)
+            return
+        if self._dl_is_running:
+            return
+
+        try:
+            limit = int(self._dl_limit_var.get().strip())
+            limit = max(1, min(limit, 500))
+        except ValueError:
+            limit = 50
+
+        self._dl_items = []
+        self._dl_lb.delete(0, tk.END)
+        self._dl_placeholder.place_forget()
+        self._dl_download_btn.configure(state="disabled")
+        self._dl_cancel_btn.configure(state="normal")
+        self._dl_is_running = True
+        self._dl_stop_flag = False
+        self._dl_clear_log()
+        self._dl_log(f"\U0001f50d  Fetching list from: {url}")
+
+        t = threading.Thread(
+            target=self._dl_fetch_worker, args=(url, limit), daemon=True
+        )
+        t.start()
+
+    def _dl_fetch_worker(self, url: str, limit: int) -> None:
+        try:
+            import yt_dlp  # type: ignore
+        except ImportError:
+            self._dl_q_log("\u274c  yt-dlp is not installed.  Run: pip install yt-dlp")
+            self._dl_q_done()
+            return
+
+        ydl_opts = {
+            "extract_flat": True,
+            "quiet": True,
+            "no_warnings": True,
+            "playlistend": limit,
+        }
+
+        try:
+            self._dl_q_progress(0.05, "Contacting YouTube…")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            if self._dl_stop_flag:
+                self._dl_q_log("\u26a0  Cancelled.")
+                self._dl_q_done()
+                return
+
+            raw_entries = (info or {}).get("entries") if info else None
+            if raw_entries is None:
+                # Single-video URL
+                if info and info.get("id"):
+                    raw_entries = [info]
+                else:
+                    self._dl_q_log("\u274c  No videos found at this URL.")
+                    self._dl_q_done()
+                    return
+
+            entries = list(raw_entries)
+            if not entries:
+                self._dl_q_log("\u274c  No videos found at this URL.")
+                self._dl_q_done()
+                return
+
+            items: List[dict] = []
+            for entry in entries:
+                if not entry:
+                    continue
+                vid_id = entry.get("id") or ""
+                title = entry.get("title") or entry.get("id") or "Unknown"
+                vid_url = (
+                    entry.get("webpage_url")
+                    or entry.get("url")
+                    or (f"https://www.youtube.com/watch?v={vid_id}" if vid_id else "")
+                )
+                if vid_url and not vid_url.startswith("http"):
+                    vid_url = f"https://www.youtube.com/watch?v={vid_url}"
+                if not vid_url:
+                    continue
+                items.append({"id": vid_id, "title": title, "url": vid_url, "status": "Pending"})
+
+            self._dl_items = items
+            self._dl_q_log(f"\u2713  Found {len(items)} video(s)")
+            self._dl_q_progress(1.0, f"{len(items)} video(s) ready to download")
+            self._dl_q_refresh_list()
+            self._dl_queue.put(("enable_download",))
+
+        except Exception as exc:
+            self._dl_q_log(f"\u274c  Failed to fetch list: {exc}")
+            self._dl_q_progress(0, "Error — see log")
+        finally:
+            self._dl_q_done()
+
+    def _dl_start(self) -> None:
+        if not self._dl_items:
+            messagebox.showwarning("No Videos",
+                                   "Please fetch a video list first.", parent=self)
+            return
+        out_dir = self._dl_out_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No Output Directory",
+                                   "Please select an output directory.", parent=self)
+            return
+        if self._dl_is_running:
+            return
+
+        # Reset failed/pending entries
+        for item in self._dl_items:
+            if item["status"] in ("Pending", "Failed"):
+                item["status"] = "Pending"
+        self._dl_refresh_list()
+
+        self._dl_is_running = True
+        self._dl_stop_flag = False
+        self._dl_download_btn.configure(state="disabled")
+        self._dl_cancel_btn.configure(state="normal")
+
+        t = threading.Thread(
+            target=self._dl_worker,
+            args=(list(self._dl_items), out_dir),
+            daemon=True,
+        )
+        t.start()
+
+    def _dl_worker(self, items: List[dict], out_dir: str) -> None:
+        download_dir = Path(out_dir)
+        try:
+            download_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._dl_q_log(f"\u274c  Cannot create output directory: {exc}")
+            self._dl_q_done()
+            return
+
+        total = len(items)
+        done = 0
+        failed = 0
+        self._dl_q_log(f"\u2b07  Downloading {total} video(s) to: {out_dir}")
+
+        for i, item in enumerate(items):
+            if self._dl_stop_flag:
+                for j in range(i, total):
+                    self._dl_items[j]["status"] = "Skipped"
+                self._dl_q_refresh_list()
+                self._dl_q_log("\u26a0  Cancelled.")
+                break
+
+            title = item["title"]
+            url = item["url"]
+
+            self._dl_items[i]["status"] = "Downloading"
+            self._dl_q_refresh_list()
+
+            short = (title[:55] + "\u2026") if len(title) > 56 else title
+            self._dl_q_progress(i / total, f"({i + 1}/{total}) {short}")
+            self._dl_q_log(f"\u2b07  [{i + 1}/{total}]  {title}")
+
+            try:
+                path = self._download_youtube_video(url, download_dir)
+                self._dl_items[i]["status"] = "Done"
+                done += 1
+                self._dl_q_log(f"  \u2713 Saved: {Path(path).name}")
+            except Exception as exc:
+                self._dl_items[i]["status"] = "Failed"
+                failed += 1
+                self._dl_q_log(f"  \u2717 Failed: {exc}")
+
+            self._dl_q_refresh_list()
+
+        summary = f"\u2705  Completed: {done}/{total} downloaded"
+        if failed:
+            summary += f", {failed} failed"
+        self._dl_q_log(summary)
+        finish_pct = done / total if total else 0
+        self._dl_q_progress(finish_pct if failed else 1.0,
+                            "Done" if not failed else "Completed with errors")
+        self._dl_q_done()
+
+    def _dl_cancel(self) -> None:
+        self._dl_stop_flag = True
+        self._dl_log("\u26a0  Cancellation requested\u2026")
+
+    def _dl_browse_out(self) -> None:
+        d = filedialog.askdirectory(title="Select Download Directory")
+        if d:
+            self._dl_out_var.set(d)
+
+    def _dl_open_folder(self) -> None:
+        out_dir = self._dl_out_var.get().strip()
+        if not out_dir:
+            return
+        path = Path(out_dir)
+        if path.is_dir():
+            import subprocess
+            subprocess.Popen(["explorer", str(path)])
+        else:
+            messagebox.showinfo("Folder Not Found",
+                                "The output folder does not exist yet.", parent=self)
+
+    def _dl_refresh_list(self) -> None:
+        self._dl_lb.delete(0, tk.END)
+        if not self._dl_items:
+            self._dl_placeholder.place(relx=0.5, rely=0.45, anchor="center")
+            return
+        self._dl_placeholder.place_forget()
+        _icons = {"Pending": "\u25cb", "Downloading": "\u2b07",
+                  "Done": "\u2713", "Failed": "\u2717", "Skipped": "\u2013"}
+        _colors = {"Done": "#a6e3a1", "Failed": "#f38ba8",
+                   "Downloading": "#89b4fa", "Skipped": "#6c6c8a"}
+        for i, item in enumerate(self._dl_items, 1):
+            icon = _icons.get(item["status"], "?")
+            t = item["title"]
+            short = (t[:65] + "\u2026") if len(t) > 66 else t
+            self._dl_lb.insert(tk.END, f"  {i:3d}.  [{icon}]  {short}")
+            color = _colors.get(item["status"])
+            if color:
+                self._dl_lb.itemconfig(tk.END, fg=color)
+
+    def _dl_log(self, msg: str) -> None:
+        self._dl_log_box.configure(state="normal")
+        self._dl_log_box.insert("end", msg + "\n")
+        self._dl_log_box.see("end")
+        self._dl_log_box.configure(state="disabled")
+
+    def _dl_clear_log(self) -> None:
+        self._dl_log_box.configure(state="normal")
+        self._dl_log_box.delete("1.0", "end")
+        self._dl_log_box.configure(state="disabled")
+
+    def _dl_q_log(self, msg: str) -> None:
+        self._dl_queue.put(("log", msg))
+
+    def _dl_q_progress(self, value: float, msg: str) -> None:
+        self._dl_queue.put(("prog", max(0.0, min(1.0, value)), msg))
+
+    def _dl_q_refresh_list(self) -> None:
+        self._dl_queue.put(("refresh",))
+
+    def _dl_q_done(self) -> None:
+        self._dl_queue.put(("done",))
+
+    def _poll_dl_queue(self) -> None:
+        try:
+            while True:
+                item = self._dl_queue.get_nowait()
+                if item[0] == "prog":
+                    self._dl_prog_bar.set(item[1])
+                    self._dl_prog_lbl.configure(text=item[2])
+                elif item[0] == "log":
+                    self._dl_log(item[1])
+                elif item[0] == "refresh":
+                    self._dl_refresh_list()
+                elif item[0] == "enable_download":
+                    self._dl_download_btn.configure(state="normal")
+                elif item[0] == "done":
+                    self._dl_is_running = False
+                    self._dl_cancel_btn.configure(state="disabled")
+                    if self._dl_items:
+                        self._dl_download_btn.configure(state="normal")
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_dl_queue)
+
     def _section(self, parent, text: str, row: int) -> int:
         ctk.CTkLabel(
             parent, text=text,
@@ -858,10 +1298,10 @@ class AIVideoToReelApp(ctk.CTk):
 
     # ── bottom panel ──────────────────────────────────────────────────────────
 
-    def _build_bottom_panel(self) -> None:
-        frame = ctk.CTkFrame(self, corner_radius=10)
-        frame.grid(row=2, column=0, columnspan=2, sticky="ew",
-                   padx=10, pady=(0, 10))
+    def _build_bottom_panel(self, parent: ctk.CTkFrame) -> None:
+        frame = ctk.CTkFrame(parent, corner_radius=10)
+        frame.grid(row=1, column=0, columnspan=2, sticky="ew",
+                   padx=6, pady=(0, 4))
         frame.grid_columnconfigure(0, weight=1)
 
         # action buttons
@@ -1787,8 +2227,538 @@ class AIVideoToReelApp(ctk.CTk):
         self.log_box.delete("1.0", "end")
         self.log_box.configure(state="disabled")
 
+    # ── enhance & colorise tab ────────────────────────────────────────────────
+
+    def _build_enhance_tab(self, parent: ctk.CTkFrame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_columnconfigure(1, weight=1)
+        parent.grid_rowconfigure(2, weight=1)
+
+        # ── LEFT column: input video ──────────────────────────────────────────
+        in_frame = ctk.CTkFrame(parent, corner_radius=10)
+        in_frame.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=(8, 4))
+        in_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            in_frame, text="INPUT VIDEO  (max 60 s)",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="gray55",
+        ).grid(row=0, column=0, padx=14, pady=(12, 4), sticky="w")
+
+        in_row = ctk.CTkFrame(in_frame, fg_color="transparent")
+        in_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        in_row.grid_columnconfigure(0, weight=1)
+
+        self._enh_input_var = ctk.StringVar()
+        ctk.CTkEntry(
+            in_row, textvariable=self._enh_input_var,
+            placeholder_text="Select a video file (MP4, MOV, AVI, MKV…)",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            in_row, text="Browse", width=72,
+            command=self._enh_browse_input,
+        ).grid(row=0, column=1, padx=(0, 4))
+        ctk.CTkButton(
+            in_row, text="Clear", width=56,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            command=self._enh_clear_input,
+        ).grid(row=0, column=2)
+
+        self._enh_info_lbl = ctk.CTkLabel(
+            in_frame,
+            text="No video selected.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray55",
+            anchor="w",
+        )
+        self._enh_info_lbl.grid(row=2, column=0, padx=14, pady=(0, 10), sticky="w")
+
+        # ── RIGHT column: output directory ────────────────────────────────────
+        out_frame = ctk.CTkFrame(parent, corner_radius=10)
+        out_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=(8, 4))
+        out_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            out_frame, text="OUTPUT DIRECTORY",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="gray55",
+        ).grid(row=0, column=0, padx=14, pady=(12, 4), sticky="w")
+
+        out_row = ctk.CTkFrame(out_frame, fg_color="transparent")
+        out_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        out_row.grid_columnconfigure(0, weight=1)
+
+        self._enh_out_dir_var = ctk.StringVar(
+            value=str(Path.home() / "Videos" / "Enhanced")
+        )
+        ctk.CTkEntry(
+            out_row, textvariable=self._enh_out_dir_var,
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            out_row, text="Browse", width=72,
+            command=self._enh_browse_output,
+        ).grid(row=0, column=1)
+
+        ctk.CTkLabel(
+            out_frame,
+            text="Output filename: {original}_enhanced.mp4",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            anchor="w",
+        ).grid(row=2, column=0, padx=14, pady=(0, 10), sticky="w")
+
+        # ── OPTIONS row ───────────────────────────────────────────────────────
+        opt_frame = ctk.CTkFrame(parent, corner_radius=10)
+        opt_frame.grid(row=1, column=0, columnspan=2, sticky="ew",
+                       padx=6, pady=4)
+        opt_frame.grid_columnconfigure(0, weight=1)
+        opt_frame.grid_columnconfigure(1, weight=1)
+
+        # Left options: Colorise
+        col_inner = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        col_inner.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        col_inner.grid_columnconfigure(0, weight=1)
+
+        self._enh_colorize_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
+            col_inner, text="Colourize  (B&W → Colour)",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            variable=self._enh_colorize_var,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        ctk.CTkLabel(
+            col_inner,
+            text="Zhang et al. (2016) Colorful Image Colorization via OpenCV DNN.\n"
+                 "Model weights (~128 MB) are downloaded on the first run and\n"
+                 "cached in %APPDATA%\\VideoToReel\\models\\.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 4))
+
+        ctk.CTkButton(
+            col_inner, text="Open model setup help",
+            height=26, fg_color="#3a3a4a", hover_color="#4a4a5a",
+            font=ctk.CTkFont(size=10),
+            command=self._enh_open_model_download,
+        ).grid(row=2, column=0, sticky="w", pady=(0, 8))
+
+        # Temporal smoothing
+        smooth_row = ctk.CTkFrame(col_inner, fg_color="transparent")
+        smooth_row.grid(row=2, column=0, sticky="ew")
+        smooth_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            smooth_row, text="Temporal smoothing",
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        ).grid(row=0, column=0, padx=(0, 8))
+
+        self._enh_smooth_lbl = ctk.CTkLabel(
+            smooth_row, text="0.85", width=40, anchor="w"
+        )
+        self._enh_smooth_slider = ctk.CTkSlider(
+            smooth_row, from_=0.50, to=0.97, number_of_steps=47,
+            command=self._on_enh_smooth_change,
+        )
+        self._enh_smooth_slider.set(0.85)
+        self._enh_smooth_slider.grid(row=0, column=1, sticky="ew", padx=4)
+        self._enh_smooth_lbl.grid(row=0, column=2, padx=2)
+
+        ctk.CTkLabel(
+            col_inner,
+            text="Higher → more stable colours across frames (less flickering).\n"
+                 "Lower → faster colour adaptation per scene.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            anchor="w",
+        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+
+        # Right options: Upscale
+        up_inner = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        up_inner.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+        up_inner.grid_columnconfigure(0, weight=1)
+
+        self._enh_upscale_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
+            up_inner, text="Upscale Resolution",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            variable=self._enh_upscale_var,
+            command=self._on_enh_upscale_toggle,
+        ).grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        ctk.CTkLabel(
+            up_inner,
+            text="Tier 1 (if installed): Real-ESRGAN  (pip install realesrgan basicsr)\n"
+                 "Tier 2 (always available): PIL LANCZOS4 + unsharp-mask.\n"
+                 "Real-ESRGAN weights (~67 MB) downloaded on first run.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            anchor="w",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+
+        factor_row = ctk.CTkFrame(up_inner, fg_color="transparent")
+        factor_row.grid(row=2, column=0, sticky="w")
+
+        ctk.CTkLabel(factor_row, text="Scale factor:", anchor="w",
+                     ).grid(row=0, column=0, padx=(0, 8))
+        self._enh_factor_var = ctk.StringVar(value="2×")
+        self._enh_factor_menu = ctk.CTkOptionMenu(
+            factor_row,
+            values=["2×", "4×"],
+            variable=self._enh_factor_var,
+            width=80,
+            command=self._on_enh_factor_change,
+        )
+        self._enh_factor_menu.grid(row=0, column=1)
+
+        self._enh_res_lbl = ctk.CTkLabel(
+            up_inner,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#89b4fa",
+            anchor="w",
+        )
+        self._enh_res_lbl.grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        # ── PROGRESS + ACTIONS row ────────────────────────────────────────────
+        bottom = ctk.CTkFrame(parent, corner_radius=10)
+        bottom.grid(row=2, column=0, columnspan=2, sticky="ew",
+                    padx=6, pady=(0, 6))
+        bottom.grid_columnconfigure(0, weight=1)
+
+        btn_bar = ctk.CTkFrame(bottom, fg_color="transparent")
+        btn_bar.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        self._enh_run_btn = ctk.CTkButton(
+            btn_bar,
+            text="\u2728  Enhance Video",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=44, width=200,
+            command=self._enh_start,
+        )
+        self._enh_run_btn.pack(side="left", padx=(0, 8))
+
+        self._enh_cancel_btn = ctk.CTkButton(
+            btn_bar, text="Cancel",
+            height=44, width=90,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            state="disabled",
+            command=self._enh_cancel,
+        )
+        self._enh_cancel_btn.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_bar, text="Open Folder",
+            height=44, width=110,
+            fg_color="#3a3a4a", hover_color="#4a4a5a",
+            command=self._enh_open_folder,
+        ).pack(side="left")
+
+        prog_row = ctk.CTkFrame(bottom, fg_color="transparent")
+        prog_row.grid(row=1, column=0, sticky="ew", padx=12, pady=2)
+        prog_row.grid_columnconfigure(0, weight=1)
+
+        self._enh_prog_bar = ctk.CTkProgressBar(prog_row)
+        self._enh_prog_bar.set(0)
+        self._enh_prog_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        self._enh_prog_lbl = ctk.CTkLabel(
+            prog_row, text="Ready", width=260,
+            font=ctk.CTkFont(size=11), anchor="w",
+        )
+        self._enh_prog_lbl.grid(row=0, column=1)
+
+        self._enh_log_box = ctk.CTkTextbox(
+            bottom, font=ctk.CTkFont(size=11, family="Consolas"),
+            height=120, state="disabled",
+        )
+        self._enh_log_box.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 10))
+
+    # ═══════════════════════════════════════ ENHANCE TAB CALLBACKS
+
+    def _on_enh_smooth_change(self, v: float) -> None:
+        self._enh_smooth_lbl.configure(text=f"{v:.2f}")
+
+    def _on_enh_upscale_toggle(self) -> None:
+        state = "normal" if self._enh_upscale_var.get() else "disabled"
+        self._enh_factor_menu.configure(state=state)
+
+    def _on_enh_factor_change(self, _value: str = "") -> None:
+        self._enh_update_res_label()
+
+    def _enh_update_res_label(self) -> None:
+        path = self._enh_input_var.get().strip()
+        if not path or not Path(path).is_file():
+            self._enh_res_lbl.configure(text="")
+            return
+        try:
+            cap = cv2.VideoCapture(path)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+        except Exception:
+            self._enh_res_lbl.configure(text="")
+            return
+        if not self._enh_upscale_var.get():
+            self._enh_res_lbl.configure(text="")
+            return
+        factor = 4 if self._enh_factor_var.get().startswith("4") else 2
+        ow, oh = w * factor, h * factor
+        if ow > 3840 or oh > 2160:
+            sx = 3840 // max(1, w)
+            sy = 2160 // max(1, h)
+            factor = max(1, min(sx, sy))
+            ow, oh = w * factor, h * factor
+            self._enh_res_lbl.configure(
+                text=f"Input: {w}×{h}  →  Output: {ow}×{oh}  (capped at 4 K)"
+            )
+        else:
+            self._enh_res_lbl.configure(
+                text=f"Input: {w}×{h}  →  Output: {ow}×{oh}"
+            )
+
+    def _enh_open_model_download(self) -> None:
+        """Open setup links for the current PyTorch colorization backend."""
+        import subprocess as _sp
+        import webbrowser
+        url_repo = "https://github.com/richzhang/colorization"
+        url_weights = "https://colorizers.s3.us-east-2.amazonaws.com/colorization_release_v2-9b330a0b.pth"
+        webbrowser.open(url_repo)
+        webbrowser.open(url_weights)
+        folder = str(self.enhancer._model_cache_dir())
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        _sp.Popen(["explorer", folder])
+        messagebox.showinfo(
+            "Colorization Model Setup",
+            "The legacy Caffe model URL is retired.\n"
+            "This app now uses the official PyTorch ECCV16 model.\n\n"
+            "What was opened for you:\n"
+            "1) richzhang/colorization repo\n"
+            "2) official weights URL\n"
+            "3) local models folder\n\n"
+            "If colorization still says unavailable, install PyTorch CPU in your venv:\n"
+            "  pip install torch --index-url https://download.pytorch.org/whl/cpu\n\n"
+            "Models cache folder:\n"
+            f"  {folder}",
+            parent=self,
+        )
+
+    def _enh_browse_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Video to Enhance",
+            filetypes=[
+                ("Video Files", "*.mp4 *.mov *.avi *.mkv *.wmv *.flv *.m4v *.webm"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if path:
+            self._enh_input_var.set(path)
+            self._enh_check_video(path)
+            self._enh_update_res_label()
+
+    def _enh_clear_input(self) -> None:
+        self._enh_input_var.set("")
+        self._enh_info_lbl.configure(text="No video selected.", text_color="gray55")
+        self._enh_res_lbl.configure(text="")
+
+    def _enh_browse_output(self) -> None:
+        d = filedialog.askdirectory(title="Select Output Directory")
+        if d:
+            self._enh_out_dir_var.set(d)
+
+    def _enh_open_folder(self) -> None:
+        import subprocess as _sp
+        d = self._enh_out_dir_var.get().strip()
+        if d and Path(d).is_dir():
+            _sp.Popen(["explorer", d])
+        else:
+            messagebox.showinfo("Folder Not Found",
+                                "Output folder does not exist yet.", parent=self)
+
+    def _enh_check_video(self, path: str) -> None:
+        """Read basic video metadata and update the info label."""
+        try:
+            cap = cv2.VideoCapture(path)
+            fps    = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            w      = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            dur = frames / fps if fps > 0 else 0.0
+            mins = int(dur) // 60
+            secs = int(dur) % 60
+            dur_str = f"{mins}:{secs:02d}"
+            if dur > 62:
+                self._enh_info_lbl.configure(
+                    text=f"⚠  Duration {dur_str} exceeds 60 s limit — "
+                         "only the first 60 s will be processed.",
+                    text_color="#f38ba8",
+                )
+            else:
+                self._enh_info_lbl.configure(
+                    text=f"Duration: {dur_str}   Resolution: {w}×{h}   "
+                         f"{fps:.2f} fps",
+                    text_color="gray65",
+                )
+        except Exception:
+            self._enh_info_lbl.configure(
+                text="Could not read video metadata.",
+                text_color="#f38ba8",
+            )
+
+    def _enh_start(self) -> None:
+        if self._enh_is_running:
+            return
+
+        input_path = self._enh_input_var.get().strip()
+        if not input_path:
+            messagebox.showwarning("No Input", "Please select a video file.", parent=self)
+            return
+        if not Path(input_path).is_file():
+            messagebox.showwarning("File Not Found",
+                                   "The selected input file does not exist.", parent=self)
+            return
+
+        colorize = self._enh_colorize_var.get()
+        upscale  = self._enh_upscale_var.get()
+        if not colorize and not upscale:
+            messagebox.showwarning("Nothing to Do",
+                                   "Enable at least one operation "
+                                   "(Colourize or Upscale).", parent=self)
+            return
+
+        out_dir = self._enh_out_dir_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No Output Directory",
+                                   "Please select an output directory.", parent=self)
+            return
+
+        factor_str = self._enh_factor_var.get()
+        factor = 4 if factor_str.startswith("4") else 2
+        if not upscale:
+            factor = 1
+
+        smooth = float(self._enh_smooth_slider.get())
+
+        stem = Path(input_path).stem
+        output_path = str(Path(out_dir) / f"{stem}_enhanced.mp4")
+
+        self._enh_is_running = True
+        self._enh_stop_flag  = False
+        self._enh_run_btn.configure(state="disabled")
+        self._enh_cancel_btn.configure(state="normal")
+        self._enh_clear_log()
+        self._enh_prog_bar.set(0)
+        self._enh_prog_lbl.configure(text="Starting…")
+
+        ops = []
+        if colorize:
+            ops.append("colourize")
+        if upscale:
+            ops.append(f"upscale {factor}×")
+        self._enh_log(f"✨  Starting enhancement: {', '.join(ops)}")
+        self._enh_log(f"   Input : {input_path}")
+        self._enh_log(f"   Output: {output_path}")
+
+        t = threading.Thread(
+            target=self._enh_worker,
+            args=(input_path, output_path, colorize, factor, smooth),
+            daemon=True,
+        )
+        t.start()
+
+    def _enh_cancel(self) -> None:
+        self._enh_stop_flag = True
+        self._enh_log("⚠  Cancellation requested…")
+
+    def _enh_worker(
+        self,
+        input_path: str,
+        output_path: str,
+        colorize: bool,
+        factor: int,
+        smooth: float,
+    ) -> None:
+        try:
+            def _progress(pct: float, msg: str) -> None:
+                self._enh_queue.put(("prog", max(0.0, min(1.0, pct)), msg))
+
+            self.enhancer.enhance(
+                input_path=input_path,
+                output_path=output_path,
+                colorize=colorize,
+                upscale_factor=factor,
+                temporal_smooth=smooth,
+                progress_callback=_progress,
+                log_callback=lambda msg: self._enh_queue.put(("log", msg)),
+                stop_check=lambda: self._enh_stop_flag,
+            )
+            self._enh_queue.put(("log", f"✅  Saved: {output_path}"))
+            self._enh_queue.put(("done", True, output_path))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Cancelled" in msg:
+                self._enh_queue.put(("log", "⚠  Enhancement cancelled."))
+            else:
+                self._enh_queue.put(("log", f"❌  {msg}"))
+            self._enh_queue.put(("done", False, ""))
+        except Exception as exc:
+            self._enh_queue.put(("log", f"❌  Unexpected error: {exc}"))
+            self._enh_queue.put(("log", traceback.format_exc()))
+            self._enh_queue.put(("done", False, ""))
+
+    def _enh_log(self, msg: str) -> None:
+        self._enh_log_box.configure(state="normal")
+        self._enh_log_box.insert("end", msg + "\n")
+        self._enh_log_box.see("end")
+        self._enh_log_box.configure(state="disabled")
+
+    def _enh_clear_log(self) -> None:
+        self._enh_log_box.configure(state="normal")
+        self._enh_log_box.delete("1.0", "end")
+        self._enh_log_box.configure(state="disabled")
+
+    def _poll_enh_queue(self) -> None:
+        try:
+            while True:
+                item = self._enh_queue.get_nowait()
+                if item[0] == "prog":
+                    self._enh_prog_bar.set(item[1])
+                    self._enh_prog_lbl.configure(text=item[2])
+                elif item[0] == "log":
+                    self._enh_log(item[1])
+                elif item[0] == "done":
+                    self._enh_is_running = False
+                    self._enh_run_btn.configure(state="normal")
+                    self._enh_cancel_btn.configure(state="disabled")
+                    success, out_path = item[1], item[2]
+                    if success:
+                        self._enh_prog_bar.set(1.0)
+                        self._enh_prog_lbl.configure(text="Done!")
+                        messagebox.showinfo(
+                            "Enhancement Complete",
+                            f"Enhanced video saved:\n{out_path}",
+                            parent=self,
+                        )
+                    else:
+                        self._enh_prog_bar.set(0)
+                        self._enh_prog_lbl.configure(text="Failed — see log")
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_enh_queue)
+
+    # ══════════════════════════════════════════════════════════════ ON CLOSE
+
     def _on_close(self) -> None:
         self._stop_flag = True
+        self._dl_stop_flag = True
+        self._enh_stop_flag = True
         self.is_processing = False
         self._save_settings()
         self.destroy()
