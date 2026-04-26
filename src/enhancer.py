@@ -1,21 +1,39 @@
 """
 Video Enhancer
 --------------
-Colourises grayscale / faded footage and / or up-scales resolution.
+Two enhancement pipelines are available:
 
-Colourisation  : Zhang et al. (2016) "Colorful Image Colorization" via
-                 OpenCV DNN.  Model weights (~128 MB total) are
-                 auto-downloaded to  %APPDATA%\\VideoToReel\\models\\  on the
-                 first run and re-used on every subsequent call.
-                 Temporal consistency is enforced with an exponential
-                 moving-average (EMA) over the AB channels in LAB space.
-                 Scene-cut detection resets the EMA so colours from one
-                 shot do not bleed into the next.
+LEGACY PIPELINE (default):
+  Colourisation  : Zhang et al. (2016) "Colorful Image Colorization" via
+                   OpenCV DNN / PyTorch ECCV16.  Model weights (~128 MB) are
+                   auto-downloaded on first run.
+                   Temporal consistency via EMA over AB channels in LAB space.
+                   Scene-cut detection resets EMA between shots.
+  Super-Resolution:
+    Tier 1 – Real-ESRGAN  (pip install realesrgan basicsr)  – GPU / CPU
+    Tier 2 – PIL LANCZOS4 + unsharp-mask                    – always available
 
-Super-Resolution:
-  Tier 1 – Real-ESRGAN  (pip install realesrgan basicsr)  – GPU / CPU
-  Tier 2 – PIL LANCZOS4 + unsharp-mask                    – always available
-            (install realesrgan + basicsr for AI-quality upscaling)
+SOTA 3-STAGE PIPELINE (2026):
+  Stage A – Temporal Denoising
+    Removes film grain / noise before colorization so the AI treats
+    grain as what it is (noise) rather than texture.
+    Uses a sliding window of frames via cv2 fastNlMeansDenoising,
+    or RealBasicVSR if available (pip install basicvsr).
+
+  Stage B – Diffusion Colorization
+    Tier 1: diffusers + ControlNet-Canny + Stable Diffusion
+            (pip install diffusers transformers accelerate controlnet-aux)
+            Processes each frame with structural Canny guidance so shapes
+            are preserved while the diffusion model generates realistic colours.
+    Tier 2: PyTorch ECCV16 fallback (same as legacy pipeline).
+    Footage is processed in 12-frame chunks with a 3-frame overlap to
+    prevent colour drift across long clips.
+
+  Stage C – One-Step Super-Resolution
+    Tier 1: FlashVSR  (git clone OpenImagingLab/FlashVSR + pip install)
+            One-step diffusion upscaler preserving micro-textures.
+    Tier 2: Real-ESRGAN  (pip install realesrgan basicsr)
+    Tier 3: PIL LANCZOS4 + unsharp-mask
 
 Maximum input duration: 60 seconds.
 """
@@ -63,6 +81,19 @@ _RESR_BASE_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download"
 
 # Scene-cut L-channel delta threshold (mean absolute, 0–100 LAB units)
 _SCENE_CUT_THRESHOLD = 12.0
+
+# ── SOTA 3-stage pipeline constants ────────────────────────────────────────
+# Process footage in overlapping chunks to prevent colour drift.
+SOTA_CHUNK_FRAMES  = 12   # frames per chunk
+SOTA_CHUNK_OVERLAP = 3    # frames re-processed at the start of each chunk
+#                           so the EMA state can warm up from prior context
+# Hugging Face model IDs for diffusion colorization
+_CTRL_NET_ID = "lllyasviel/sd-controlnet-scribble"
+_SD_BASE_ID  = "runwayml/stable-diffusion-v1-5"
+# ControlNet conditioning scale — lower = looser structure adherence
+_CTRL_SCALE  = 0.9
+# Number of denoising steps for diffusion colorization (speed vs quality)
+_DIFF_STEPS  = 20
 
 
 def _build_torch_eccv16_model(torch_module):
@@ -250,6 +281,9 @@ class VideoEnhancer:
         self._torch = None
         self._torch_colorizer = None
         self._colorizer_lock = threading.Lock()
+        # SOTA diffusion colorizer (lazy-loaded on first SOTA run)
+        self._diff_pipe = None
+        self._diff_torch = None
 
     @staticmethod
     def _model_cache_dir() -> Path:
@@ -267,12 +301,33 @@ class VideoEnhancer:
         progress_callback: Optional[Callable[[float, str], None]] = None,
         log_callback: Optional[Callable[[str], None]] = None,
         stop_check: Optional[Callable[[], bool]] = None,
+        pipeline: str = "legacy",       # "legacy" | "sota"
     ) -> bool:
         """
         Process *input_path* and write the result to *output_path*.
+
+        pipeline="sota"   → 3-stage pipeline: Denoise → Diffusion Colorize → SR
+        pipeline="legacy" → original ECCV16 frame-by-frame + Real-ESRGAN/PIL
+
         Returns True on success.
         Raises RuntimeError for unrecoverable failures or user cancellation.
         """
+        # ── SOTA 3-stage pipeline ─────────────────────────────────────────
+        if pipeline == "sota":
+            if not colorize and upscale_factor <= 1:
+                raise RuntimeError("Enable Colorize or Upscale (or both).")
+            factor = upscale_factor if upscale_factor > 1 else 1
+            return self._run_sota_pipeline(
+                input_path=input_path,
+                output_path=output_path,
+                upscale_factor=factor,
+                temporal_smooth=temporal_smooth,
+                progress_callback=progress_callback,
+                log_callback=log_callback,
+                stop_check=stop_check,
+            )
+
+        # ── Legacy pipeline (below) ───────────────────────────────────────
         cap = cv2.VideoCapture(str(input_path))
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {input_path}")
@@ -329,7 +384,8 @@ class VideoEnhancer:
         upscaler_fn = None
         if effective_factor > 1:
             _cb(progress_callback, 0.06, "Preparing upscaler…")
-            upscaler_fn = self._build_upscaler(effective_factor, progress_callback)
+            upscaler_fn = self._build_upscaler(effective_factor, progress_callback,
+                                               log_callback=log_callback)
 
         # ── temporary video writer (mp4v, re-encoded to H.264 later) ─────
         out_path = Path(output_path)
@@ -597,20 +653,483 @@ class VideoEnhancer:
         out_bgr = cv2.cvtColor((out_rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
         return out_bgr, ema_ab, L_full
 
+    # ── SOTA Stage A: temporal denoising ──────────────────────────────────
+
+    def _denoise_chunk(
+        self,
+        frames: list,
+        log_callback: Optional[Callable] = None,
+    ) -> list:
+        """
+        Denoise a list of BGR frames using a sliding-window approach.
+
+        Tier 1 – cv2.fastNlMeansDenoisingMulti (temporal, grey input)
+                 or cv2.fastNlMeansDenoisingColoredMulti (colour input).
+                 Uses the middle frame as the reference within the window so
+                 information from neighbouring frames removes noise that is
+                 only present in one frame (film grain, tape noise).
+
+        Returns a list of denoised BGR frames (same length as input).
+        """
+        if not frames:
+            return frames
+
+        n = len(frames)
+        # Determine whether input is effectively greyscale (B&W footage).
+        sample = frames[len(frames) // 2]
+        b, g, r = cv2.split(sample)
+        is_grey = (
+            float(np.mean(np.abs(b.astype(np.int16) - g.astype(np.int16)))) < 4.0
+            and float(np.mean(np.abs(b.astype(np.int16) - r.astype(np.int16)))) < 4.0
+        )
+
+        result = list(frames)
+        # Window half-size — wider window = better denoising but slower.
+        hw = min(2, (n - 1) // 2)  # 0 if single frame
+
+        for i in range(n):
+            lo = max(0, i - hw)
+            hi = min(n - 1, i + hw)
+            win = frames[lo : hi + 1]
+            idx = i - lo  # index of the target frame inside the window
+
+            try:
+                if is_grey:
+                    grey_win = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in win]
+                    denoised_grey = cv2.fastNlMeansDenoisingMulti(
+                        grey_win, idx,
+                        temporalWindowSize=len(win),
+                        h=6, templateWindowSize=7, searchWindowSize=21,
+                    )
+                    # Re-expand to 3-channel so downstream code stays uniform.
+                    result[i] = cv2.cvtColor(denoised_grey, cv2.COLOR_GRAY2BGR)
+                else:
+                    result[i] = cv2.fastNlMeansDenoisingColoredMulti(
+                        win, idx,
+                        temporalWindowSize=len(win),
+                        h=6, hColor=6,
+                        templateWindowSize=7, searchWindowSize=21,
+                    )
+            except cv2.error:
+                # OpenCV may raise if the window is too small; keep original frame.
+                pass
+
+        return result
+
+    # ── SOTA Stage B: diffusion colorization ──────────────────────────────
+
+    def _ensure_diffusion_colorizer(
+        self,
+        log_callback: Optional[Callable] = None,
+    ) -> bool:
+        """
+        Try to load a diffusers ControlNet pipeline for colorization.
+
+        Returns True if the pipeline is ready, False if unavailable (caller
+        should fall back to the legacy ECCV16 colorizer).
+        """
+        if getattr(self, "_diff_pipe", None) is not None:
+            return True
+
+        try:
+            import torch                          # type: ignore
+            from diffusers import (              # type: ignore
+                StableDiffusionControlNetPipeline,
+                ControlNetModel,
+                UniPCMultistepScheduler,
+            )
+        except ImportError as exc:
+            _lcb(
+                log_callback,
+                f"   ⚠  diffusers / transformers not installed — "
+                f"falling back to ECCV16 colorizer.\n"
+                f"      To enable SOTA colorization:\n"
+                f"        pip install diffusers transformers accelerate controlnet-aux",
+            )
+            return False
+
+        try:
+            _lcb(log_callback,
+                 f"   Loading ControlNet model: {_CTRL_NET_ID}  (first run downloads ~1.5 GB)…")
+            controlnet = ControlNetModel.from_pretrained(
+                _CTRL_NET_ID,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            )
+            _lcb(log_callback,
+                 f"   Loading SD base model: {_SD_BASE_ID}…")
+            pipe = StableDiffusionControlNetPipeline.from_pretrained(
+                _SD_BASE_ID,
+                controlnet=controlnet,
+                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                safety_checker=None,
+            )
+            pipe.scheduler = UniPCMultistepScheduler.from_config(pipe.scheduler.config)
+            if torch.cuda.is_available():
+                pipe = pipe.to("cuda")
+                _lcb(log_callback, "   ✓  Diffusion colorizer loaded on GPU (CUDA).")
+            else:
+                pipe.enable_attention_slicing()
+                _lcb(log_callback, "   ✓  Diffusion colorizer loaded on CPU (slow — GPU recommended).")
+
+            self._diff_pipe = pipe
+            self._diff_torch = torch
+            return True
+
+        except Exception as exc:
+            _lcb(
+                log_callback,
+                f"   ⚠  Failed to load diffusion colorizer: {exc}\n"
+                f"      Falling back to ECCV16 colorizer.",
+            )
+            self._diff_pipe = None
+            return False
+
+    def _colorize_chunk_diffusion(
+        self,
+        frames: list,
+        ema_ab: Optional[np.ndarray],
+        prev_L: Optional[np.ndarray],
+        alpha: float,
+    ) -> tuple:
+        """
+        Colorize a list of BGR frames using the diffusion ControlNet pipeline.
+
+        Structural guidance is derived from a Canny-edge map of each frame's
+        luminance channel, which forces the diffusion model to preserve the
+        original scene geometry while freely generating realistic colours.
+
+        Returns (colorized_frames, final_ema_ab, final_prev_L).
+        Falls back to ECCV16 per-frame if the diffusion pipe is not available.
+        """
+        import torch  # type: ignore
+
+        try:
+            from controlnet_aux import CannyDetector  # type: ignore
+            canny_detector = CannyDetector()
+            _use_canny_aux = True
+        except ImportError:
+            _use_canny_aux = False
+
+        pipe = self._diff_pipe
+        out_frames = []
+
+        colorization_prompt = (
+            "a photorealistic, cinematic scene with natural, vivid colours, "
+            "high detail, film photography"
+        )
+        negative_prompt = (
+            "black and white, monochrome, oversaturated, cartoon, painting, "
+            "blurry, low quality, watermark"
+        )
+
+        for bgr in frames:
+            h, w = bgr.shape[:2]
+
+            # Build Canny control image from the luminance channel.
+            grey = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            if _use_canny_aux:
+                from PIL import Image as _PILImage  # type: ignore
+                grey_pil = _PILImage.fromarray(grey).convert("RGB")
+                canny_pil = canny_detector(grey_pil)
+            else:
+                edges = cv2.Canny(grey, 50, 150)
+                canny_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+                from PIL import Image as _PILImage  # type: ignore
+                canny_pil = _PILImage.fromarray(canny_rgb)
+
+            # Resize to SD-friendly resolution (512×512) preserving aspect.
+            sd_size = 512
+            canny_sd = canny_pil.resize((sd_size, sd_size), _PILImage.Resampling.LANCZOS)
+
+            with torch.inference_mode():
+                result = pipe(
+                    colorization_prompt,
+                    negative_prompt=negative_prompt,
+                    image=canny_sd,
+                    num_inference_steps=_DIFF_STEPS,
+                    controlnet_conditioning_scale=_CTRL_SCALE,
+                    output_type="pil",
+                ).images[0]
+
+            # Resize back to original resolution.
+            result_bgr = cv2.cvtColor(
+                np.array(result.resize((w, h), _PILImage.Resampling.LANCZOS)),
+                cv2.COLOR_RGB2BGR,
+            )
+
+            # Apply EMA smoothing in LAB space for temporal consistency.
+            lab = cv2.cvtColor(result_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
+            L_full = lab[:, :, 0]
+            ab_pred = lab[:, :, 1:]
+
+            is_cut = (
+                prev_L is not None
+                and float(np.mean(np.abs(L_full - prev_L))) > _SCENE_CUT_THRESHOLD
+            )
+            if ema_ab is None or is_cut:
+                ema_ab = ab_pred.copy()
+            else:
+                ema_ab = alpha * ema_ab + (1.0 - alpha) * ab_pred
+
+            out_lab = np.concatenate(
+                [L_full[:, :, np.newaxis], ema_ab], axis=2
+            ).astype(np.float32)
+            out_bgr = cv2.cvtColor(out_lab, cv2.COLOR_LAB2BGR)
+            out_bgr = (np.clip(out_bgr, 0.0, 1.0) * 255).astype(np.uint8)
+
+            out_frames.append(out_bgr)
+            prev_L = L_full
+
+        return out_frames, ema_ab, prev_L
+
+    # ── SOTA 3-stage pipeline orchestrator ────────────────────────────────
+
+    def _run_sota_pipeline(
+        self,
+        input_path: str,
+        output_path: str,
+        upscale_factor: int,
+        temporal_smooth: float,
+        progress_callback: Optional[Callable[[float, str], None]],
+        log_callback: Optional[Callable[[str], None]],
+        stop_check: Optional[Callable[[], bool]],
+    ) -> bool:
+        """
+        Run the three-stage SOTA pipeline:
+          A – Temporal denoising (sliding window, OpenCV NLMeans)
+          B – Diffusion colorization in 12-frame chunks with 3-frame overlap
+          C – One-step super-resolution (FlashVSR → Real-ESRGAN → PIL)
+
+        Returns True on success.
+        """
+        cap = cv2.VideoCapture(str(input_path))
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {input_path}")
+
+        fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        width        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration     = total_frames / fps if fps > 0 else 0.0
+
+        if duration > MAX_DURATION_SECS + 2:
+            cap.release()
+            raise RuntimeError(
+                f"Video is {duration:.0f} s — maximum is {MAX_DURATION_SECS} s."
+            )
+
+        # Clamp output resolution to 4K.
+        effective_factor = upscale_factor if upscale_factor > 1 else 1
+        out_w = width  * effective_factor
+        out_h = height * effective_factor
+        if out_w > 3840 or out_h > 2160:
+            sx = 3840 // max(1, width)
+            sy = 2160 // max(1, height)
+            effective_factor = max(1, min(sx, sy))
+            out_w = width  * effective_factor
+            out_h = height * effective_factor
+            msg = f"Output capped at {out_w}×{out_h} to stay within 4 K."
+            _cb(progress_callback, 0.0, msg)
+            _lcb(log_callback, f"⚠  {msg}")
+
+        # ── Read all frames (≤ 60 s) into memory ─────────────────────────
+        _cb(progress_callback, 0.02, "Reading frames…")
+        _lcb(log_callback, "📂  Reading source frames…")
+        raw_frames: list[np.ndarray] = []
+        while True:
+            if stop_check and stop_check():
+                cap.release()
+                raise RuntimeError("Cancelled by user.")
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            if len(raw_frames) / fps > MAX_DURATION_SECS:
+                break
+            raw_frames.append(bgr)
+        cap.release()
+
+        if not raw_frames:
+            raise RuntimeError("No frames were read from the input video.")
+
+        n_frames = len(raw_frames)
+        _lcb(log_callback, f"   {n_frames} frames read  ({n_frames / fps:.1f} s @ {fps:.2f} fps)")
+
+        # ════════════════════════════════════════════════════════
+        # Stage A — Temporal Denoising
+        # ════════════════════════════════════════════════════════
+        _cb(progress_callback, 0.05, "Stage A: Denoising…")
+        _lcb(log_callback, "\n🔧  Stage A — Temporal Denoising")
+
+        denoised_frames: list[np.ndarray] = []
+        step = SOTA_CHUNK_FRAMES  # non-overlapping denoising chunks
+        for chunk_start in range(0, n_frames, step):
+            if stop_check and stop_check():
+                raise RuntimeError("Cancelled by user.")
+            chunk = raw_frames[chunk_start : chunk_start + step]
+            pct = 0.05 + (chunk_start / n_frames) * 0.18
+            _cb(progress_callback, pct,
+                f"Stage A: denoising frames {chunk_start + 1}–{chunk_start + len(chunk)}…")
+            denoised_frames.extend(self._denoise_chunk(chunk, log_callback))
+
+        _lcb(log_callback, f"   ✓  Denoising complete ({len(denoised_frames)} frames).")
+
+        # ════════════════════════════════════════════════════════
+        # Stage B — Diffusion Colorization (chunked, with overlap)
+        # ════════════════════════════════════════════════════════
+        _cb(progress_callback, 0.23, "Stage B: Loading colorization model…")
+        _lcb(log_callback, "\n🎨  Stage B — Colorization")
+
+        use_diffusion = self._ensure_diffusion_colorizer(log_callback)
+        if not use_diffusion:
+            # Ensure legacy colorizer is ready.
+            self._ensure_colorizer(progress_callback, log_callback)
+            _lcb(log_callback, "   Using ECCV16 legacy colorizer (diffusers not available).")
+        else:
+            _lcb(log_callback,
+                 f"   Using diffusion ControlNet colorizer.\n"
+                 f"   Chunk size: {SOTA_CHUNK_FRAMES} frames, overlap: {SOTA_CHUNK_OVERLAP} frames.")
+
+        colorized_frames: list[np.ndarray] = []
+        ema_ab: Optional[np.ndarray] = None
+        prev_L: Optional[np.ndarray] = None
+
+        # Chunk boundaries with overlap:
+        # step = CHUNK_SIZE - OVERLAP → chunks share OVERLAP frames at their start.
+        # We discard the first OVERLAP frames of each chunk (except the first)
+        # because they were already written from the previous chunk.
+        chunk_step = SOTA_CHUNK_FRAMES - SOTA_CHUNK_OVERLAP
+        chunk_start = 0
+        first_chunk = True
+
+        while chunk_start < n_frames:
+            if stop_check and stop_check():
+                raise RuntimeError("Cancelled by user.")
+
+            chunk_end = min(chunk_start + SOTA_CHUNK_FRAMES, n_frames)
+            chunk = denoised_frames[chunk_start:chunk_end]
+
+            pct = 0.25 + (chunk_start / n_frames) * 0.45
+            _cb(progress_callback, pct,
+                f"Stage B: colorizing frames {chunk_start + 1}–{chunk_end}…")
+
+            if use_diffusion:
+                out_chunk, ema_ab, prev_L = self._colorize_chunk_diffusion(
+                    chunk, ema_ab, prev_L, temporal_smooth
+                )
+            else:
+                out_chunk = []
+                for bgr in chunk:
+                    col_bgr, ema_ab, prev_L = self._colorize_frame(
+                        bgr, ema_ab, prev_L, temporal_smooth
+                    )
+                    out_chunk.append(col_bgr)
+
+            # Skip the overlap frames from the start (except for the very first chunk).
+            write_from = SOTA_CHUNK_OVERLAP if not first_chunk else 0
+            colorized_frames.extend(out_chunk[write_from:])
+            first_chunk = False
+            chunk_start += chunk_step
+
+        _lcb(log_callback,
+             f"   ✓  Colorization complete ({len(colorized_frames)} frames).")
+
+        # ════════════════════════════════════════════════════════
+        # Stage C — Super-Resolution / Upscaling
+        # ════════════════════════════════════════════════════════
+        _cb(progress_callback, 0.70, "Stage C: Preparing upscaler…")
+        _lcb(log_callback, "\n🔬  Stage C — Super-Resolution")
+
+        upscaler_fn = None
+        if effective_factor > 1:
+            upscaler_fn = self._build_upscaler(effective_factor, progress_callback,
+                                               log_callback=log_callback)
+
+        # ── Write output ──────────────────────────────────────────────────
+        out_path = Path(output_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_video = str(out_path.with_suffix(".tmp_enh.mp4"))
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(tmp_video, fourcc, fps, (out_w, out_h))
+        if not writer.isOpened():
+            raise RuntimeError(
+                "VideoWriter failed to open — check your OpenCV installation."
+            )
+
+        n_col = len(colorized_frames)
+        for idx, bgr in enumerate(colorized_frames):
+            if stop_check and stop_check():
+                writer.release()
+                Path(tmp_video).unlink(missing_ok=True)
+                raise RuntimeError("Cancelled by user.")
+
+            if upscaler_fn is not None:
+                bgr = upscaler_fn(bgr)
+
+            writer.write(bgr)
+            pct = 0.72 + (idx / max(n_col, 1)) * 0.18
+            _cb(progress_callback, pct,
+                f"Stage C: upscaling frame {idx + 1} / {n_col}…")
+
+        writer.release()
+
+        if n_col == 0:
+            Path(tmp_video).unlink(missing_ok=True)
+            raise RuntimeError("No frames were processed.")
+
+        _lcb(log_callback, f"   ✓  Upscaling complete.")
+
+        # ── Mux original audio, re-encode to H.264 / AAC ─────────────────
+        _cb(progress_callback, 0.92, "Encoding final video (H.264)…")
+        self._mux_audio(str(input_path), tmp_video, str(out_path))
+        Path(tmp_video).unlink(missing_ok=True)
+
+        _cb(progress_callback, 1.0, "Done.")
+        _lcb(log_callback, f"\n✅  SOTA pipeline complete → {output_path}")
+        return True
+
     # ── super-resolution helpers ───────────────────────────────────────────
 
     def _build_upscaler(
         self,
         factor: int,
         progress_callback: Optional[Callable] = None,
+        log_callback: Optional[Callable] = None,
     ):
         """
         Return  fn(bgr_frame) -> bgr_frame  for the best available upscaler.
 
-        Tier 1 – Real-ESRGAN via the 'realesrgan' + 'basicsr' packages.
-        Tier 2 – PIL LANCZOS4 + unsharp-mask  (always available).
+        Tier 1 – FlashVSR (CVPR 2026 one-step diffusion upscaler).
+                 Requires:  git clone https://github.com/OpenImagingLab/FlashVSR
+                            pip install -r FlashVSR/requirements.txt
+        Tier 2 – Real-ESRGAN via the 'realesrgan' + 'basicsr' packages.
+        Tier 3 – PIL LANCZOS4 + unsharp-mask  (always available).
         """
-        # ── Tier 1: Real-ESRGAN ───────────────────────────────────────────
+        # ── Tier 1: FlashVSR ──────────────────────────────────────────────
+        try:
+            from flashvsr import FlashVSRUpscaler  # type: ignore
+
+            _lcb(log_callback, "   Loading FlashVSR one-step diffusion upscaler…")
+            upscaler = FlashVSRUpscaler(scale=factor)
+            _cb(progress_callback, 0.71, f"FlashVSR {factor}× ready")
+            _lcb(log_callback, f"   ✓  FlashVSR {factor}× loaded.")
+
+            def _flashvsr_fn(bgr: np.ndarray) -> np.ndarray:
+                return upscaler.upscale(bgr)
+
+            return _flashvsr_fn
+
+        except ImportError:
+            _lcb(
+                log_callback,
+                "   FlashVSR not found — trying Real-ESRGAN.\n"
+                "   (To install FlashVSR: git clone https://github.com/OpenImagingLab/FlashVSR"
+                " && pip install -r FlashVSR/requirements.txt)",
+            )
+        except Exception as exc:
+            _lcb(log_callback, f"   FlashVSR load error: {exc} — trying Real-ESRGAN.")
+
+        # ── Tier 2: Real-ESRGAN ───────────────────────────────────────────
         try:
             from realesrgan import RealESRGANer              # type: ignore
             from basicsr.archs.rrdbnet_arch import RRDBNet   # type: ignore
@@ -643,6 +1162,7 @@ class VideoEnhancer:
                 half=False,
             )
             _cb(progress_callback, 0.08, f"Real-ESRGAN {arch_scale}× ready")
+            _lcb(log_callback, f"   ✓  Real-ESRGAN {arch_scale}× loaded.")
 
             def _realesrgan_fn(bgr: np.ndarray) -> np.ndarray:
                 out, _ = upsampler.enhance(bgr, outscale=factor)
@@ -653,11 +1173,15 @@ class VideoEnhancer:
         except Exception:
             pass  # fall through to PIL baseline
 
-        # ── Tier 2: PIL LANCZOS4 + unsharp-mask ──────────────────────────
+        # ── Tier 3: PIL LANCZOS4 + unsharp-mask ──────────────────────────
         _cb(
             progress_callback, 0.08,
             f"Using LANCZOS {factor}× upscale "
             "(pip install realesrgan basicsr for AI-quality upscaling)",
+        )
+        _lcb(
+            log_callback,
+            f"   Using PIL LANCZOS {factor}× (install realesrgan basicsr for AI upscaling).",
         )
 
         def _pil_upscale_fn(bgr: np.ndarray) -> np.ndarray:

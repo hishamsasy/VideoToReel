@@ -10,8 +10,19 @@ imageio-ffmpeg>=0.4.9
 imageio>=2.31.1
 yt-dlp>=2025.1.0
 
-# ── Enhance & Colorise tab (optional — improves upscaling quality) ──────────
+# ── Enhance & Colorise tab — Legacy pipeline (optional, improves upscaling) ─
 # pip install torch --index-url https://download.pytorch.org/whl/cpu
 # pip install realesrgan basicsr
 # realesrgan>=0.3.0
 # basicsr>=1.4.2
+
+# ── Enhance & Colorise tab — SOTA 3-Stage Pipeline (2026) ───────────────────
+# Stage B — Diffusion Colorization (ControlNet + Stable Diffusion)
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#   pip install diffusers transformers accelerate controlnet-aux
+#   First run downloads ~1.5 GB of ControlNet + SD model weights via HuggingFace.
+#
+# Stage C — FlashVSR one-step super-resolution (Tier-1 upscaler)
+#   git clone https://github.com/OpenImagingLab/FlashVSR
+#   pip install -r FlashVSR/requirements.txt
+#   (Falls back to Real-ESRGAN → PIL LANCZOS4 if not installed)

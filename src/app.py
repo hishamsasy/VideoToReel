@@ -2232,7 +2232,7 @@ class AIVideoToReelApp(ctk.CTk):
     def _build_enhance_tab(self, parent: ctk.CTkFrame) -> None:
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_columnconfigure(1, weight=1)
-        parent.grid_rowconfigure(2, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
 
         # ── LEFT column: input video ──────────────────────────────────────────
         in_frame = ctk.CTkFrame(parent, corner_radius=10)
@@ -2309,9 +2309,42 @@ class AIVideoToReelApp(ctk.CTk):
             anchor="w",
         ).grid(row=2, column=0, padx=14, pady=(0, 10), sticky="w")
 
+        # ── PIPELINE SELECTOR row ─────────────────────────────────────────────
+        pipe_frame = ctk.CTkFrame(parent, corner_radius=10)
+        pipe_frame.grid(row=1, column=0, columnspan=2, sticky="ew",
+                        padx=6, pady=(4, 0))
+        pipe_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            pipe_frame, text="Pipeline:",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=0, column=0, padx=(14, 10), pady=10, sticky="w")
+
+        self._enh_pipeline_var = ctk.StringVar(value="Legacy (ECCV16)")
+        self._enh_pipeline_menu = ctk.CTkSegmentedButton(
+            pipe_frame,
+            values=["Legacy (ECCV16)", "SOTA 3-Stage (2026)"],
+            variable=self._enh_pipeline_var,
+            command=self._on_enh_pipeline_change,
+            font=ctk.CTkFont(size=12),
+        )
+        self._enh_pipeline_menu.grid(row=0, column=1, padx=(0, 14), pady=10, sticky="w")
+
+        self._enh_pipe_desc_lbl = ctk.CTkLabel(
+            pipe_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            anchor="w",
+            wraplength=680,
+        )
+        self._enh_pipe_desc_lbl.grid(row=1, column=0, columnspan=2,
+                                     padx=14, pady=(0, 10), sticky="w")
+
         # ── OPTIONS row ───────────────────────────────────────────────────────
         opt_frame = ctk.CTkFrame(parent, corner_radius=10)
-        opt_frame.grid(row=1, column=0, columnspan=2, sticky="ew",
+        opt_frame.grid(row=2, column=0, columnspan=2, sticky="ew",
                        padx=6, pady=4)
         opt_frame.grid_columnconfigure(0, weight=1)
         opt_frame.grid_columnconfigure(1, weight=1)
@@ -2328,16 +2361,15 @@ class AIVideoToReelApp(ctk.CTk):
             variable=self._enh_colorize_var,
         ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
-        ctk.CTkLabel(
+        self._enh_colorize_desc_lbl = ctk.CTkLabel(
             col_inner,
-            text="Zhang et al. (2016) Colorful Image Colorization via OpenCV DNN.\n"
-                 "Model weights (~128 MB) are downloaded on the first run and\n"
-                 "cached in %APPDATA%\\VideoToReel\\models\\.",
+            text="",
             font=ctk.CTkFont(size=10),
             text_color="gray55",
             justify="left",
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 4))
+        )
+        self._enh_colorize_desc_lbl.grid(row=1, column=0, sticky="w", pady=(0, 4))
 
         ctk.CTkButton(
             col_inner, text="Open model setup help",
@@ -2348,7 +2380,7 @@ class AIVideoToReelApp(ctk.CTk):
 
         # Temporal smoothing
         smooth_row = ctk.CTkFrame(col_inner, fg_color="transparent")
-        smooth_row.grid(row=2, column=0, sticky="ew")
+        smooth_row.grid(row=3, column=0, sticky="ew")
         smooth_row.grid_columnconfigure(1, weight=1)
 
         ctk.CTkLabel(
@@ -2376,7 +2408,7 @@ class AIVideoToReelApp(ctk.CTk):
             text_color="gray55",
             justify="left",
             anchor="w",
-        ).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, sticky="w", pady=(4, 0))
 
         # Right options: Upscale
         up_inner = ctk.CTkFrame(opt_frame, fg_color="transparent")
@@ -2391,16 +2423,15 @@ class AIVideoToReelApp(ctk.CTk):
             command=self._on_enh_upscale_toggle,
         ).grid(row=0, column=0, sticky="w", pady=(0, 6))
 
-        ctk.CTkLabel(
+        self._enh_upscale_desc_lbl = ctk.CTkLabel(
             up_inner,
-            text="Tier 1 (if installed): Real-ESRGAN  (pip install realesrgan basicsr)\n"
-                 "Tier 2 (always available): PIL LANCZOS4 + unsharp-mask.\n"
-                 "Real-ESRGAN weights (~67 MB) downloaded on first run.",
+            text="",
             font=ctk.CTkFont(size=10),
             text_color="gray55",
             justify="left",
             anchor="w",
-        ).grid(row=1, column=0, sticky="w", pady=(0, 8))
+        )
+        self._enh_upscale_desc_lbl.grid(row=1, column=0, sticky="w", pady=(0, 8))
 
         factor_row = ctk.CTkFrame(up_inner, fg_color="transparent")
         factor_row.grid(row=2, column=0, sticky="w")
@@ -2428,7 +2459,7 @@ class AIVideoToReelApp(ctk.CTk):
 
         # ── PROGRESS + ACTIONS row ────────────────────────────────────────────
         bottom = ctk.CTkFrame(parent, corner_radius=10)
-        bottom.grid(row=2, column=0, columnspan=2, sticky="ew",
+        bottom.grid(row=3, column=0, columnspan=2, sticky="ew",
                     padx=6, pady=(0, 6))
         bottom.grid_columnconfigure(0, weight=1)
 
@@ -2480,7 +2511,62 @@ class AIVideoToReelApp(ctk.CTk):
         )
         self._enh_log_box.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 10))
 
+        # Initialise dynamic description labels to reflect default pipeline.
+        self._on_enh_pipeline_change("Legacy (ECCV16)")
+
     # ═══════════════════════════════════════ ENHANCE TAB CALLBACKS
+
+    # Pipeline descriptions shown in the UI.
+    _PIPELINE_DESCRIPTIONS = {
+        "Legacy (ECCV16)": (
+            "Zhang et al. (2016) ECCV16 Colorful Image Colorization via PyTorch.\n"
+            "EMA temporal smoothing and scene-cut detection reduce flicker.\n"
+            "Model weights (~129 MB) are auto-downloaded on first run."
+        ),
+        "SOTA 3-Stage (2026)": (
+            "Stage A – Temporal denoising (NLMeans sliding window) removes film grain before colorization.\n"
+            "Stage B – Diffusion ControlNet colorization in 12-frame chunks with 3-frame overlap to prevent colour drift.\n"
+            "Stage C – FlashVSR one-step diffusion upscaler (falls back to Real-ESRGAN → PIL).\n"
+            "Requires: pip install diffusers transformers accelerate controlnet-aux  "
+            "(first run downloads ~1.5 GB ControlNet + SD models)."
+        ),
+    }
+    _COLORIZE_DESCRIPTIONS = {
+        "Legacy (ECCV16)": (
+            "Zhang et al. (2016) Colorful Image Colorization via PyTorch ECCV16.\n"
+            "Model weights (~129 MB) downloaded on first run to %APPDATA%\\VideoToReel\\models\\."
+        ),
+        "SOTA 3-Stage (2026)": (
+            "Diffusion ControlNet (scribble / structure guidance) + Stable Diffusion.\n"
+            "Chunked processing (12 frames, 3-frame overlap) prevents colour drift.\n"
+            "Falls back to ECCV16 if diffusers / transformers are not installed."
+        ),
+    }
+    _UPSCALE_DESCRIPTIONS = {
+        "Legacy (ECCV16)": (
+            "Tier 1 (if installed): Real-ESRGAN  (pip install realesrgan basicsr)\n"
+            "Tier 2 (always available): PIL LANCZOS4 + unsharp-mask.\n"
+            "Real-ESRGAN weights (~67 MB) downloaded on first run."
+        ),
+        "SOTA 3-Stage (2026)": (
+            "Tier 1: FlashVSR (CVPR 2026 one-step diffusion upscaler — preserves micro-textures).\n"
+            "         git clone https://github.com/OpenImagingLab/FlashVSR  &&  pip install -r FlashVSR/requirements.txt\n"
+            "Tier 2: Real-ESRGAN  (pip install realesrgan basicsr)\n"
+            "Tier 3: PIL LANCZOS4 + unsharp-mask  (always available)."
+        ),
+    }
+
+    def _on_enh_pipeline_change(self, value: str = "") -> None:
+        key = self._enh_pipeline_var.get() if not value else value
+        self._enh_pipe_desc_lbl.configure(
+            text=self._PIPELINE_DESCRIPTIONS.get(key, "")
+        )
+        self._enh_colorize_desc_lbl.configure(
+            text=self._COLORIZE_DESCRIPTIONS.get(key, "")
+        )
+        self._enh_upscale_desc_lbl.configure(
+            text=self._UPSCALE_DESCRIPTIONS.get(key, "")
+        )
 
     def _on_enh_smooth_change(self, v: float) -> None:
         self._enh_smooth_lbl.configure(text=f"{v:.2f}")
@@ -2524,30 +2610,52 @@ class AIVideoToReelApp(ctk.CTk):
             )
 
     def _enh_open_model_download(self) -> None:
-        """Open setup links for the current PyTorch colorization backend."""
+        """Open setup links for the active colorization backend."""
         import subprocess as _sp
         import webbrowser
-        url_repo = "https://github.com/richzhang/colorization"
-        url_weights = "https://colorizers.s3.us-east-2.amazonaws.com/colorization_release_v2-9b330a0b.pth"
-        webbrowser.open(url_repo)
-        webbrowser.open(url_weights)
+        pipeline = self._enh_pipeline_var.get()
         folder = str(self.enhancer._model_cache_dir())
         Path(folder).mkdir(parents=True, exist_ok=True)
         _sp.Popen(["explorer", folder])
-        messagebox.showinfo(
-            "Colorization Model Setup",
-            "The legacy Caffe model URL is retired.\n"
-            "This app now uses the official PyTorch ECCV16 model.\n\n"
-            "What was opened for you:\n"
-            "1) richzhang/colorization repo\n"
-            "2) official weights URL\n"
-            "3) local models folder\n\n"
-            "If colorization still says unavailable, install PyTorch CPU in your venv:\n"
-            "  pip install torch --index-url https://download.pytorch.org/whl/cpu\n\n"
-            "Models cache folder:\n"
-            f"  {folder}",
-            parent=self,
-        )
+
+        if pipeline == "SOTA 3-Stage (2026)":
+            webbrowser.open("https://huggingface.co/lllyasviel/sd-controlnet-scribble")
+            webbrowser.open("https://huggingface.co/runwayml/stable-diffusion-v1-5")
+            webbrowser.open("https://github.com/OpenImagingLab/FlashVSR")
+            messagebox.showinfo(
+                "SOTA Pipeline — Model Setup",
+                "Opened:\n"
+                "1) ControlNet scribble (HuggingFace)\n"
+                "2) Stable Diffusion v1-5 (HuggingFace)\n"
+                "3) FlashVSR repository (GitHub)\n"
+                "4) Local models folder\n\n"
+                "To install all SOTA dependencies:\n"
+                "  pip install diffusers transformers accelerate controlnet-aux\n"
+                "  pip install torch torchvision torchaudio\n\n"
+                "For FlashVSR (Tier-1 upscaler):\n"
+                "  git clone https://github.com/OpenImagingLab/FlashVSR\n"
+                "  pip install -r FlashVSR/requirements.txt\n\n"
+                "Models are cached by HuggingFace in %USERPROFILE%\\.cache\\huggingface\\\n"
+                f"\nLegacy models folder:\n  {folder}",
+                parent=self,
+            )
+        else:
+            url_repo = "https://github.com/richzhang/colorization"
+            url_weights = "https://colorizers.s3.us-east-2.amazonaws.com/colorization_release_v2-9b330a0b.pth"
+            webbrowser.open(url_repo)
+            webbrowser.open(url_weights)
+            messagebox.showinfo(
+                "Legacy Colorization — Model Setup",
+                "This app uses the official PyTorch ECCV16 model (richzhang/colorization).\n\n"
+                "What was opened for you:\n"
+                "1) richzhang/colorization repo\n"
+                "2) Official ECCV16 weights (~129 MB)\n"
+                "3) Local models folder\n\n"
+                "If colorization says unavailable, install PyTorch CPU:\n"
+                "  pip install torch --index-url https://download.pytorch.org/whl/cpu\n\n"
+                f"Models cache folder:\n  {folder}",
+                parent=self,
+            )
 
     def _enh_browse_input(self) -> None:
         path = filedialog.askopenfilename(
@@ -2645,9 +2753,12 @@ class AIVideoToReelApp(ctk.CTk):
             factor = 1
 
         smooth = float(self._enh_smooth_slider.get())
+        pipeline_label = self._enh_pipeline_var.get()
+        pipeline = "sota" if "SOTA" in pipeline_label else "legacy"
 
         stem = Path(input_path).stem
-        output_path = str(Path(out_dir) / f"{stem}_enhanced.mp4")
+        suffix = "_sota_enhanced" if pipeline == "sota" else "_enhanced"
+        output_path = str(Path(out_dir) / f"{stem}{suffix}.mp4")
 
         self._enh_is_running = True
         self._enh_stop_flag  = False
@@ -2657,18 +2768,22 @@ class AIVideoToReelApp(ctk.CTk):
         self._enh_prog_bar.set(0)
         self._enh_prog_lbl.configure(text="Starting…")
 
-        ops = []
-        if colorize:
-            ops.append("colourize")
-        if upscale:
-            ops.append(f"upscale {factor}×")
-        self._enh_log(f"✨  Starting enhancement: {', '.join(ops)}")
+        if pipeline == "sota":
+            self._enh_log(f"🚀  SOTA 3-Stage Pipeline (2026)")
+            self._enh_log(f"   Stage A: Temporal Denoising  |  Stage B: Diffusion Colorization  |  Stage C: SR Upscale")
+        else:
+            ops = []
+            if colorize:
+                ops.append("colourize")
+            if upscale:
+                ops.append(f"upscale {factor}×")
+            self._enh_log(f"✨  Starting enhancement (Legacy): {', '.join(ops)}")
         self._enh_log(f"   Input : {input_path}")
         self._enh_log(f"   Output: {output_path}")
 
         t = threading.Thread(
             target=self._enh_worker,
-            args=(input_path, output_path, colorize, factor, smooth),
+            args=(input_path, output_path, colorize, factor, smooth, pipeline),
             daemon=True,
         )
         t.start()
@@ -2684,6 +2799,7 @@ class AIVideoToReelApp(ctk.CTk):
         colorize: bool,
         factor: int,
         smooth: float,
+        pipeline: str = "legacy",
     ) -> None:
         try:
             def _progress(pct: float, msg: str) -> None:
@@ -2698,6 +2814,7 @@ class AIVideoToReelApp(ctk.CTk):
                 progress_callback=_progress,
                 log_callback=lambda msg: self._enh_queue.put(("log", msg)),
                 stop_check=lambda: self._enh_stop_flag,
+                pipeline=pipeline,
             )
             self._enh_queue.put(("log", f"✅  Saved: {output_path}"))
             self._enh_queue.put(("done", True, output_path))
