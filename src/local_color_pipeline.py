@@ -25,9 +25,28 @@ from typing import Callable, Optional
 
 DDCOLOR_MODEL = "piddnad/ddcolor_modelscope"
 COLORMNET_CKPT = "DINOv2FeatureV6_LocalAtten_s2_154000.pth"
+COLORMNET_CKPT_URL = (
+    "https://github.com/yyang181/colormnet/releases/download/v0.1/"
+    "DINOv2FeatureV6_LocalAtten_s2_154000.pth"
+)
 
 
-def check_local_colorization_dependencies() -> tuple[list[str], list[str]]:
+def get_device_info() -> tuple[str, str]:
+    """Return (device_str, human_label) e.g. ('cuda', 'GPU: NVIDIA RTX 3080') or ('cpu', 'CPU (no GPU)')."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            name = torch.cuda.get_device_name(idx)
+            return "cuda", f"GPU: {name}"
+    except Exception:
+        pass
+    return "cpu", "CPU (no GPU detected)"
+
+
+def check_local_colorization_dependencies(
+    require_colormnet: bool = True,
+) -> tuple[list[str], list[str]]:
     """
     Returns (missing_python_packages, missing_tools_or_repos).
     """
@@ -35,6 +54,7 @@ def check_local_colorization_dependencies() -> tuple[list[str], list[str]]:
         "cv2": "opencv-python-headless",
         "numpy": "numpy",
         "torch": "torch",
+        "torchvision": "torchvision",
         "PIL": "Pillow",
         "tqdm": "tqdm",
         "huggingface_hub": "huggingface_hub",
@@ -45,13 +65,15 @@ def check_local_colorization_dependencies() -> tuple[list[str], list[str]]:
             missing_packages.append(package_name)
 
     missing_other: list[str] = []
-    if shutil.which("ffmpeg") is None:
-        missing_other.append("ffmpeg executable (required in PATH)")
+    try:
+        _get_ffmpeg_executable()
+    except RuntimeError:
+        missing_other.append("ffmpeg executable or imageio-ffmpeg package")
 
     project_root = Path(__file__).resolve().parent.parent
     if not (project_root / "DDColor").is_dir():
         missing_other.append("DDColor repo folder (expected at ./DDColor)")
-    if not (project_root / "colormnet").is_dir():
+    if require_colormnet and not (project_root / "colormnet").is_dir():
         missing_other.append("ColorMNet repo folder (expected at ./colormnet)")
 
     return missing_packages, missing_other
@@ -65,6 +87,52 @@ def _cb(progress_callback: Optional[Callable[[float, str], None]], value: float,
 def _check_cancel(stop_check: Optional[Callable[[], bool]]) -> None:
     if stop_check and stop_check():
         raise RuntimeError("Cancelled by user")
+
+
+def _get_ffmpeg_executable() -> str:
+    ffmpeg_exe = shutil.which("ffmpeg")
+    if ffmpeg_exe:
+        return ffmpeg_exe
+
+    try:
+        import imageio_ffmpeg  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(
+            "ffmpeg is unavailable. Install ffmpeg or the imageio-ffmpeg package."
+        ) from exc
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    if not ffmpeg_exe:
+        raise RuntimeError(
+            "ffmpeg is unavailable. Install ffmpeg or the imageio-ffmpeg package."
+        )
+    return ffmpeg_exe
+
+
+def _ensure_colormnet_checkpoint(project_root: Path) -> str:
+    candidate_paths = [
+        project_root / "checkpoints" / COLORMNET_CKPT,
+        project_root / "colormnet" / "saves" / COLORMNET_CKPT,
+        project_root / COLORMNET_CKPT,
+    ]
+    for candidate in candidate_paths:
+        if candidate.is_file():
+            return str(candidate)
+
+    target = project_root / "checkpoints" / COLORMNET_CKPT
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import urllib.request
+
+        urllib.request.urlretrieve(COLORMNET_CKPT_URL, str(target))
+    except Exception as exc:
+        raise RuntimeError(
+            "ColorMNet checkpoint is missing and automatic download failed. "
+            f"Place {COLORMNET_CKPT} in ./checkpoints or ./colormnet/saves."
+        ) from exc
+
+    return str(target)
 
 
 def extract_frames(
@@ -105,9 +173,10 @@ def extract_frames(
 def rebuild_video(frames_dir: str, output_path: str, fps: float, audio_source: Optional[str] = None) -> None:
     pattern = os.path.join(frames_dir, "%06d.png")
     tmp_video = output_path.replace(".mp4", "_noaudio.mp4")
+    ffmpeg_exe = _get_ffmpeg_executable()
 
     cmd = [
-        "ffmpeg", "-y", "-framerate", str(fps),
+        ffmpeg_exe, "-y", "-framerate", str(fps),
         "-i", pattern,
         "-c:v", "libx264", "-crf", "18", "-preset", "slow",
         "-pix_fmt", "yuv420p", tmp_video,
@@ -116,7 +185,7 @@ def rebuild_video(frames_dir: str, output_path: str, fps: float, audio_source: O
 
     if audio_source:
         cmd2 = [
-            "ffmpeg", "-y",
+            ffmpeg_exe, "-y",
             "-i", tmp_video,
             "-i", audio_source,
             "-c:v", "copy", "-c:a", "aac", "-shortest",
@@ -134,13 +203,23 @@ def load_ddcolor(half: bool = True):
 
     project_root = Path(__file__).resolve().parent.parent
     ddcolor_path = str(project_root / "DDColor")
-    if ddcolor_path not in sys.path:
-        sys.path.insert(0, ddcolor_path)
+
+    # Always insert at position 0 so the vendored basicsr is always found first.
+    # Avoid duplicates by removing any prior entry first.
+    sys.path = [p for p in sys.path if os.path.normcase(p) != os.path.normcase(ddcolor_path)]
+    sys.path.insert(0, ddcolor_path)
+
+    # Clear any stale partial imports so a fresh load is attempted.
+    for _key in [k for k in sys.modules if k == "ddcolor" or k.startswith("ddcolor.")]:
+        del sys.modules[_key]
 
     try:
         from ddcolor import DDColor
     except Exception as exc:
-        raise RuntimeError("DDColor import failed. Ensure ./DDColor is cloned and installed") from exc
+        raise RuntimeError(
+            f"DDColor import failed ({type(exc).__name__}: {exc}). "
+            "Ensure ./DDColor is cloned and its dependencies are installed."
+        ) from exc
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -163,14 +242,16 @@ def colorize_frame_ddcolor(model, bgr_frame, device: str, half: bool = True):
     import numpy as np
     import torch
 
-    img_rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-    img_lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-    l_chan = img_lab[:, :, 0]
-
     h, w = bgr_frame.shape[:2]
-    img_512 = cv2.resize(l_chan, (512, 512), interpolation=cv2.INTER_LINEAR)
-    img_tensor = torch.from_numpy(img_512).float() / 100.0
-    img_tensor = img_tensor.unsqueeze(0).unsqueeze(0)
+    img = (bgr_frame / 255.0).astype(np.float32)
+    orig_l = cv2.cvtColor(img, cv2.COLOR_BGR2Lab)[:, :, :1]
+
+    img_resized = cv2.resize(img, (512, 512), interpolation=cv2.INTER_LINEAR)
+    img_l = cv2.cvtColor(img_resized, cv2.COLOR_BGR2Lab)[:, :, :1]
+    img_gray_lab = np.concatenate((img_l, np.zeros_like(img_l), np.zeros_like(img_l)), axis=-1)
+    img_gray_rgb = cv2.cvtColor(img_gray_lab, cv2.COLOR_LAB2RGB)
+
+    img_tensor = torch.from_numpy(img_gray_rgb.transpose((2, 0, 1))).float().unsqueeze(0)
     if half and device == "cuda":
         img_tensor = img_tensor.half()
     img_tensor = img_tensor.to(device)
@@ -182,15 +263,9 @@ def colorize_frame_ddcolor(model, bgr_frame, device: str, half: bool = True):
     ab_pred = ab_pred.transpose(1, 2, 0)
     ab_pred = cv2.resize(ab_pred, (w, h))
 
-    result_lab = np.zeros((h, w, 3), dtype=np.float32)
-    result_lab[:, :, 0] = l_chan.astype(np.float32)
-    result_lab[:, :, 1] = ab_pred[:, :, 0] * 128
-    result_lab[:, :, 2] = ab_pred[:, :, 1] * 128
-    result_lab = np.clip(result_lab, [0, -128, -128], [100, 127, 127])
-
-    result_rgb = cv2.cvtColor(result_lab.astype(np.float32), cv2.COLOR_LAB2RGB)
-    result_bgr = cv2.cvtColor((result_rgb * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-    return result_bgr
+    output_lab = np.concatenate((orig_l, ab_pred), axis=-1)
+    output_bgr = cv2.cvtColor(output_lab, cv2.COLOR_LAB2BGR)
+    return np.clip(output_bgr * 255.0, 0, 255).astype(np.uint8)
 
 
 def run_ddcolor(
@@ -236,37 +311,51 @@ def run_colormnet(
     import numpy as np
     import torch
     from PIL import Image
-    from huggingface_hub import hf_hub_download
 
     project_root = Path(__file__).resolve().parent.parent
     colormnet_path = str(project_root / "colormnet")
-    if colormnet_path not in sys.path:
-        sys.path.insert(0, colormnet_path)
+    sys.path = [p for p in sys.path if os.path.normcase(p) != os.path.normcase(colormnet_path)]
+    sys.path.insert(0, colormnet_path)
+
+    # Ensure DDColor's basicsr is also available (needed if colormnet imports basicsr).
+    ddcolor_path = str(project_root / "DDColor")
+    if os.path.normcase(ddcolor_path) not in [os.path.normcase(p) for p in sys.path]:
+        sys.path.insert(0, ddcolor_path)
 
     try:
         from inference.inference_core import InferenceCore
+        from dataset.range_transform import RGB2Lab, ToTensor, im_rgb2lab_normalization
         from model.network import ColorMNet
+        from util.transforms import lab2rgb_transform_PIL
+        from torchvision import transforms
     except Exception as exc:
         raise RuntimeError("ColorMNet import failed. Ensure ./colormnet is cloned and installed") from exc
 
     os.makedirs(out_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ckpt_path = hf_hub_download(
-        repo_id="yyang181/colormnet",
-        filename=COLORMNET_CKPT,
-        local_dir=str(project_root / "checkpoints"),
-    )
+    ckpt_path = _ensure_colormnet_checkpoint(project_root)
 
-    mem_every = 5 if memory_mode == "high_quality" else 10
-    network = ColorMNet(single_object=False, mem_every=mem_every)
-    network.load_weights(ckpt_path)
+    mem_every = 15 if memory_mode == "low_memory" else 5 if memory_mode == "high_quality" else 10
+
+    config = {
+        "mem_every": mem_every,
+        "deep_update_every": -1,
+        "enable_long_term": True,
+        "enable_long_term_count_usage": False,
+        "max_mid_term_frames": 10,
+        "min_mid_term_frames": 5,
+        "max_long_term_elements": 10000,
+        "num_prototypes": 128,
+        "top_k": 30,
+        "single_object": False,
+    }
+
+    network = ColorMNet(config, ckpt_path, map_location=device)
     network = network.to(device)
     if half and device == "cuda":
         network = network.half()
     network.eval()
-
-    processor = InferenceCore(network, config={"mem_every": mem_every})
 
     gray_frames = sorted(Path(grayscale_frames_dir).glob("*.png"))
     color_frames = sorted(Path(colorized_frames_dir).glob("*.png"))
@@ -275,26 +364,59 @@ def run_colormnet(
     if len(gray_frames) != len(color_frames):
         raise RuntimeError("ColorMNet input mismatch between grayscale and colorized frame counts")
 
-    if reference_image_path:
-        ref_img = Image.open(reference_image_path).convert("RGB")
-    else:
-        ref_img = Image.open(str(color_frames[0])).convert("RGB")
-
     total = len(gray_frames)
+    config["enable_long_term_count_usage"] = (
+        config["enable_long_term"]
+        and (total / (config["max_mid_term_frames"] - config["min_mid_term_frames"]) * config["num_prototypes"])
+        >= config["max_long_term_elements"]
+    )
+    processor = InferenceCore(network, config=config)
+
+    lab_transform = transforms.Compose([
+        RGB2Lab(),
+        ToTensor(),
+        im_rgb2lab_normalization,
+    ])
+    labels = list(range(1, 3))
+    processor.set_all_labels(labels)
+
+    def _to_lab_tensor(image_path: str, size: tuple[int, int] | None = None):
+        image = Image.open(image_path).convert("RGB")
+        if size is not None:
+            image = image.resize(size, Image.BILINEAR)
+        return lab_transform(image)
+
     for i, (gray_fp, color_fp) in enumerate(zip(gray_frames, color_frames), start=1):
         _check_cancel(stop_check)
 
-        gray = np.array(Image.open(str(gray_fp)).convert("L"))
-        color_hint = np.array(Image.open(str(color_fp)).convert("RGB"))
+        gray_lab = _to_lab_tensor(str(gray_fp))
+        gray_lll = gray_lab[:1, :, :].repeat(3, 1, 1)
+        step_kwargs = {
+            "image": gray_lll.to(device),
+            "valid_labels": labels,
+            "end": i == total,
+        }
+
+        if i == 1:
+            if reference_image_path:
+                ref_lab = _to_lab_tensor(reference_image_path, size=(gray_lab.shape[2], gray_lab.shape[1]))
+                step_kwargs.update({
+                    "msk_lll": ref_lab[:1, :, :].repeat(3, 1, 1).to(device),
+                    "msk_ab": ref_lab[1:3, :, :].to(device),
+                    "flag_FirstframeIsExemplar": False,
+                })
+            else:
+                first_color_lab = _to_lab_tensor(str(color_fp), size=(gray_lab.shape[2], gray_lab.shape[1]))
+                step_kwargs.update({
+                    "msk_ab": first_color_lab[1:3, :, :].to(device),
+                    "flag_FirstframeIsExemplar": True,
+                })
 
         with torch.no_grad():
-            result = processor.step(
-                gray_frame=gray,
-                color_hint=color_hint,
-                reference=ref_img if i == 1 else None,
-            )
+            result_ab = processor.step_AnyExemplar(**step_kwargs).cpu()
 
-        out_img = Image.fromarray(result.astype(np.uint8))
+        result_rgb = lab2rgb_transform_PIL(torch.cat([gray_lab[:1, :, :], result_ab], dim=0))
+        out_img = Image.fromarray((result_rgb * 255).astype(np.uint8))
         out_img.save(os.path.join(out_dir, gray_fp.name))
 
         if i % 10 == 0 or i == total:
@@ -306,31 +428,58 @@ def run_colormnet(
 
 
 def load_realesrgan(scale: int = 4, half: bool = True):
-    import torch
-    from basicsr.archs.rrdbnet_arch import RRDBNet
-    from realesrgan import RealESRGANer
+    class _PilUpsampler:
+        def __init__(self, factor: int):
+            self.factor = factor
+            self.backend_label = f"PIL LANCZOS x{factor}"
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_name = f"RealESRGAN_x{scale}plus"
-    model = RRDBNet(
-        num_in_ch=3,
-        num_out_ch=3,
-        num_feat=64,
-        num_block=23,
-        num_grow_ch=32,
-        scale=scale,
-    )
-    upsampler = RealESRGANer(
-        scale=scale,
-        model_path=f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/{model_name}.pth",
-        model=model,
-        tile=512,
-        tile_pad=10,
-        pre_pad=0,
-        half=(half and device == "cuda"),
-        device=device,
-    )
-    return upsampler
+        def enhance(self, img, outscale=None):
+            import cv2
+            import numpy as np
+            from PIL import Image, ImageFilter
+
+            factor = int(outscale or self.factor)
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb)
+            pil = pil.resize((pil.width * factor, pil.height * factor), Image.Resampling.LANCZOS)
+            pil = pil.filter(ImageFilter.UnsharpMask(radius=1.0, percent=60, threshold=3))
+            out = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            return out, None
+
+    try:
+        import torch
+        from basicsr.archs.rrdbnet_arch import RRDBNet
+        from realesrgan import RealESRGANer
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_name = f"RealESRGAN_x{scale}plus"
+        model_url = (
+            f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/{model_name}.pth"
+            if scale >= 4
+            else f"https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/{model_name}.pth"
+        )
+        model = RRDBNet(
+            num_in_ch=3,
+            num_out_ch=3,
+            num_feat=64,
+            num_block=23,
+            num_grow_ch=32,
+            scale=scale,
+        )
+        upsampler = RealESRGANer(
+            scale=scale,
+            model_path=model_url,
+            model=model,
+            tile=512,
+            tile_pad=10,
+            pre_pad=0,
+            half=(half and device == "cuda"),
+            device=device,
+        )
+        upsampler.backend_label = f"Real-ESRGAN x{scale}"
+        return upsampler
+    except Exception:
+        return _PilUpsampler(scale)
 
 
 def run_realesrgan(
@@ -346,6 +495,7 @@ def run_realesrgan(
 
     os.makedirs(out_dir, exist_ok=True)
     upsampler = load_realesrgan(scale=scale, half=half)
+    backend_label = getattr(upsampler, "backend_label", f"Real-ESRGAN x{scale}")
     frames = sorted(Path(frames_dir).glob("*.png"))
     total = len(frames)
     if total == 0:
@@ -357,7 +507,7 @@ def run_realesrgan(
         enhanced, _ = upsampler.enhance(img, outscale=scale)
         cv2.imwrite(os.path.join(out_dir, fp.name), enhanced)
         if i % 10 == 0 or i == total:
-            _cb(progress_callback, 0.70 + 0.20 * (i / total), f"Real-ESRGAN x{scale} ({i}/{total})")
+            _cb(progress_callback, 0.70 + 0.20 * (i / total), f"{backend_label} ({i}/{total})")
 
     del upsampler
     if torch.cuda.is_available():
@@ -422,20 +572,6 @@ def run_local_colorization_pipeline(
         if log_callback:
             log_callback(message)
 
-    missing_pkgs, missing_other = check_local_colorization_dependencies()
-    if missing_pkgs or missing_other:
-        lines = ["Missing prerequisites for local colorization:"]
-        if missing_pkgs:
-            lines.append("Python packages:")
-            for pkg in missing_pkgs:
-                lines.append(f"  - {pkg}")
-        if missing_other:
-            lines.append("Tools/repos:")
-            for item in missing_other:
-                lines.append(f"  - {item}")
-        lines.append("Install requirements and clone DDColor/ColorMNet before running.")
-        raise RuntimeError("\n".join(lines))
-
     if not Path(input_video).is_file():
         raise RuntimeError(f"Input video not found: {input_video}")
 
@@ -452,10 +588,43 @@ def run_local_colorization_pipeline(
     }
 
     try:
-        _cb(progress_callback, 0.01, "Preparing local colorization pipeline")
+        device_str, device_label = get_device_info()
+        effective_skip_colormnet = skip_colormnet
+        if device_str == "cpu" and not effective_skip_colormnet:
+            effective_skip_colormnet = True
+            _log("ColorMNet requires CUDA/spatial_correlation_sampler in this repo; skipping ColorMNet on CPU")
+
+        missing_pkgs, missing_other = check_local_colorization_dependencies(
+            require_colormnet=not effective_skip_colormnet,
+        )
+        if missing_pkgs or missing_other:
+            lines = ["Missing prerequisites for local colorization:"]
+            lines.append(f"Active Python: {sys.executable}")
+            if missing_pkgs:
+                lines.append("Python packages:")
+                for pkg in missing_pkgs:
+                    lines.append(f"  - {pkg}")
+            if missing_other:
+                lines.append("Tools/repos:")
+                for item in missing_other:
+                    lines.append(f"  - {item}")
+            project_root = Path(__file__).resolve().parent.parent
+            repo_python = project_root / "venv" / "Scripts" / "python.exe"
+            if repo_python.is_file() and os.path.normcase(sys.executable) != os.path.normcase(str(repo_python)):
+                lines.append(f"Repo venv: {repo_python}")
+                lines.append("Start the app with ./run.bat or the repo venv interpreter.")
+            lines.append("Install requirements and clone DDColor/ColorMNet before running.")
+            raise RuntimeError("\n".join(lines))
+
+        # CPU does not support float16 — override half automatically
+        if device_str == "cpu":
+            half = False
+
+        _cb(progress_callback, 0.01, f"Preparing pipeline [{device_label}]")
         _log(f"Input : {input_video}")
         _log(f"Output: {output_video}")
-        _log(f"Upscale x{upscale} | memory_mode={memory_mode}")
+        _log(f"Device: {device_label}")
+        _log(f"Upscale x{upscale} | memory_mode={memory_mode} | half={half}")
 
         fps = extract_frames(input_video, steps["raw"], progress_callback=progress_callback, stop_check=stop_check)
 
@@ -468,7 +637,7 @@ def run_local_colorization_pipeline(
             half=half,
         )
 
-        if not skip_colormnet:
+        if not effective_skip_colormnet:
             _log("Running ColorMNet")
             run_colormnet(
                 grayscale_frames_dir=steps["raw"],

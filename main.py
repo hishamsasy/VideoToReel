@@ -2,8 +2,40 @@
 AI Video to Reel — entry point
 """
 
-import sys
 import os
+import sys
+from pathlib import Path
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return os.path.normcase(str(left)) == os.path.normcase(str(right))
+
+
+def _find_repo_venv_python() -> Path | None:
+    project_root = Path(__file__).resolve().parent
+    candidates = [
+        project_root / "venv" / "Scripts" / "python.exe",
+        project_root / "venv" / "bin" / "python",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _ensure_repo_venv() -> None:
+    repo_python = _find_repo_venv_python()
+    if repo_python is None:
+        return
+
+    current_python = Path(sys.executable)
+    if _same_path(current_python, repo_python):
+        return
+
+    os.execv(str(repo_python), [str(repo_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 def _check_deps() -> list[str]:
@@ -17,7 +49,6 @@ def _check_deps() -> list[str]:
         "numpy":         "numpy",
         "PIL":           "Pillow",
         "soundfile":     "soundfile",
-        "yt_dlp":        "yt-dlp",
     }
     missing = []
     for mod, pip_name in packages.items():
@@ -27,6 +58,8 @@ def _check_deps() -> list[str]:
 
 
 def main() -> None:
+    _ensure_repo_venv()
+
     missing = _check_deps()
     if missing:
         print("=" * 60)

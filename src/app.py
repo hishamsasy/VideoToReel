@@ -2947,9 +2947,14 @@ class AIVideoToReelApp(ctk.CTk):
             command=lambda: self._local_ref_var.set(""),
         ).grid(row=0, column=2)
 
+        try:
+            from .local_color_pipeline import get_device_info as _gdi
+            _, _dev_label = _gdi()
+        except Exception:
+            _dev_label = "device unknown"
         self._local_info_lbl = ctk.CTkLabel(
             in_frame,
-            text="DDColor -> ColorMNet -> Real-ESRGAN -> Deflicker",
+            text=f"DDColor -> ColorMNet -> Real-ESRGAN -> Deflicker  |  {_dev_label}",
             font=ctk.CTkFont(size=11),
             text_color="gray55",
             anchor="w",
@@ -3225,6 +3230,12 @@ class AIVideoToReelApp(ctk.CTk):
         self._local_log("Stack: DDColor -> ColorMNet -> Real-ESRGAN -> Deflicker")
         self._local_log(f"Input : {input_path}")
         self._local_log(f"Output: {output_path}")
+        try:
+            from .local_color_pipeline import get_device_info as _gdi
+            _, _dev_label = _gdi()
+        except Exception:
+            _dev_label = "unknown device"
+        self._local_log(f"Device: {_dev_label}")
 
         t = threading.Thread(
             target=self._local_worker,
@@ -3287,6 +3298,11 @@ class AIVideoToReelApp(ctk.CTk):
                 self._local_queue.put(("log", "Local colorization cancelled."))
             else:
                 self._local_queue.put(("log", f"Error: {msg}"))
+                # Surface the full cause chain so it is visible in the log box.
+                cause = exc.__cause__
+                if cause is not None:
+                    self._local_queue.put(("log", f"  Caused by {type(cause).__name__}: {cause}"))
+                self._local_queue.put(("log", traceback.format_exc()))
             self._local_queue.put(("done", False, ""))
         except Exception as exc:
             self._local_queue.put(("log", f"Unexpected error: {exc}"))
