@@ -13,6 +13,7 @@ without these heavy optional dependencies installed.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import shutil
@@ -71,10 +72,16 @@ def check_local_colorization_dependencies(
         missing_other.append("ffmpeg executable or imageio-ffmpeg package")
 
     project_root = Path(__file__).resolve().parent.parent
-    if not (project_root / "DDColor").is_dir():
+    ddcolor_root = project_root / "DDColor"
+    if not ddcolor_root.is_dir() or not (ddcolor_root / "ddcolor" / "__init__.py").is_file():
         missing_other.append("DDColor repo folder (expected at ./DDColor)")
-    if require_colormnet and not (project_root / "colormnet").is_dir():
+    colormnet_root = project_root / "colormnet"
+    if require_colormnet and (
+        not colormnet_root.is_dir() or not (colormnet_root / "inference" / "inference_core.py").is_file()
+    ):
         missing_other.append("ColorMNet repo folder (expected at ./colormnet)")
+    if require_colormnet and importlib.util.find_spec("spatial_correlation_sampler") is None:
+        missing_other.append("spatial_correlation_sampler CUDA extension for ColorMNet")
 
     return missing_packages, missing_other
 
@@ -172,6 +179,9 @@ def extract_frames(
 
 def rebuild_video(frames_dir: str, output_path: str, fps: float, audio_source: Optional[str] = None) -> None:
     pattern = os.path.join(frames_dir, "%06d.png")
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     tmp_video = output_path.replace(".mp4", "_noaudio.mp4")
     ffmpeg_exe = _get_ffmpeg_executable()
 
@@ -380,6 +390,12 @@ def run_colormnet(
     labels = list(range(1, 3))
     processor.set_all_labels(labels)
 
+    def _move_tensor(tensor):
+        tensor = tensor.to(device)
+        if half and device == "cuda":
+            tensor = tensor.half()
+        return tensor
+
     def _to_lab_tensor(image_path: str, size: tuple[int, int] | None = None):
         image = Image.open(image_path).convert("RGB")
         if size is not None:
@@ -392,8 +408,7 @@ def run_colormnet(
         gray_lab = _to_lab_tensor(str(gray_fp))
         gray_lll = gray_lab[:1, :, :].repeat(3, 1, 1)
         step_kwargs = {
-            "image": gray_lll.to(device),
-            "valid_labels": labels,
+            "image": _move_tensor(gray_lll),
             "end": i == total,
         }
 
@@ -401,19 +416,19 @@ def run_colormnet(
             if reference_image_path:
                 ref_lab = _to_lab_tensor(reference_image_path, size=(gray_lab.shape[2], gray_lab.shape[1]))
                 step_kwargs.update({
-                    "msk_lll": ref_lab[:1, :, :].repeat(3, 1, 1).to(device),
-                    "msk_ab": ref_lab[1:3, :, :].to(device),
+                    "msk_lll": _move_tensor(ref_lab[:1, :, :].repeat(3, 1, 1)),
+                    "msk_ab": _move_tensor(ref_lab[1:3, :, :]),
                     "flag_FirstframeIsExemplar": False,
                 })
             else:
                 first_color_lab = _to_lab_tensor(str(color_fp), size=(gray_lab.shape[2], gray_lab.shape[1]))
                 step_kwargs.update({
-                    "msk_ab": first_color_lab[1:3, :, :].to(device),
+                    "msk_ab": _move_tensor(first_color_lab[1:3, :, :]),
                     "flag_FirstframeIsExemplar": True,
                 })
 
         with torch.no_grad():
-            result_ab = processor.step_AnyExemplar(**step_kwargs).cpu()
+            result_ab = processor.step_AnyExemplar(**step_kwargs).cpu().float()
 
         result_rgb = lab2rgb_transform_PIL(torch.cat([gray_lab[:1, :, :], result_ab], dim=0))
         out_img = Image.fromarray((result_rgb * 255).astype(np.uint8))
@@ -448,6 +463,11 @@ def load_realesrgan(scale: int = 4, half: bool = True):
 
     try:
         import torch
+
+        if importlib.util.find_spec("torchvision.transforms.functional_tensor") is None:
+            functional_tensor = importlib.import_module("torchvision.transforms._functional_tensor")
+            sys.modules["torchvision.transforms.functional_tensor"] = functional_tensor
+
         from basicsr.archs.rrdbnet_arch import RRDBNet
         from realesrgan import RealESRGANer
 
@@ -593,6 +613,12 @@ def run_local_colorization_pipeline(
         if device_str == "cpu" and not effective_skip_colormnet:
             effective_skip_colormnet = True
             _log("ColorMNet requires CUDA/spatial_correlation_sampler in this repo; skipping ColorMNet on CPU")
+        elif not effective_skip_colormnet and importlib.util.find_spec("spatial_correlation_sampler") is None:
+            effective_skip_colormnet = True
+            _log(
+                "ColorMNet requires the spatial_correlation_sampler CUDA extension; "
+                "skipping ColorMNet because it is unavailable in the current environment"
+            )
 
         missing_pkgs, missing_other = check_local_colorization_dependencies(
             require_colormnet=not effective_skip_colormnet,
