@@ -19,6 +19,7 @@ It uses classical AI and signal-processing techniques rather than a large neural
 - Live preview thumbnail for logo placement and scale before export
 - AI scoring weight controls for motion, faces, and audio
 - Chronological ordering option
+- Local Colorization tab: DDColor + ColorMNet + Real-ESRGAN + optional deflicker
 
 ## How It Works
 
@@ -81,6 +82,27 @@ python -m venv venv
 .\venv\Scripts\activate
 pip install -r requirements.txt
 python main.py
+```
+
+### Optional setup for Local Colorization tab
+
+```powershell
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+pip install huggingface_hub transformers basicsr
+pip install realesrgan
+pip install opencv-python-headless tqdm ffmpeg-python Pillow einops
+
+git clone https://github.com/yyang181/colormnet
+cd colormnet
+pip install -r requirements.txt
+python setup.py develop
+cd ..
+
+git clone https://github.com/piddnad/DDColor
+cd DDColor
+pip install -r requirements.txt
+python setup.py develop
+cd ..
 ```
 
 ## Usage

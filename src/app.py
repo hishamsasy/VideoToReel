@@ -173,6 +173,10 @@ class AIVideoToReelApp(ctk.CTk):
         self._enh_stop_flag: bool = False
         self._enh_queue: queue.Queue = queue.Queue()
 
+        self._local_is_running: bool = False
+        self._local_stop_flag: bool = False
+        self._local_queue: queue.Queue = queue.Queue()
+
         self.analyzer  = VideoAnalyzer()
         self.processor = VideoProcessor()
         self.enhancer  = VideoEnhancer()
@@ -186,6 +190,7 @@ class AIVideoToReelApp(ctk.CTk):
         self._poll_queue()
         self._poll_dl_queue()
         self._poll_enh_queue()
+        self._poll_local_queue()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _settings_dir(self) -> Path:
@@ -419,10 +424,12 @@ class AIVideoToReelApp(ctk.CTk):
         self._tab_view.add("\U0001f3ac  Reel Creator")
         self._tab_view.add("\u2b07  Batch Downloader")
         self._tab_view.add("\u2728  Enhance & Colorise")
+        self._tab_view.add("\U0001f3a8  Local Colorization")
 
         self._build_reel_tab(self._tab_view.tab("\U0001f3ac  Reel Creator"))
         self._build_downloader_tab(self._tab_view.tab("\u2b07  Batch Downloader"))
         self._build_enhance_tab(self._tab_view.tab("\u2728  Enhance & Colorise"))
+        self._build_local_color_tab(self._tab_view.tab("\U0001f3a8  Local Colorization"))
 
     # ── header ────────────────────────────────────────────────────────────────
 
@@ -2870,12 +2877,469 @@ class AIVideoToReelApp(ctk.CTk):
             pass
         self.after(80, self._poll_enh_queue)
 
+    # ── local colorization tab ───────────────────────────────────────────────
+
+    def _build_local_color_tab(self, parent: ctk.CTkFrame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_columnconfigure(1, weight=1)
+        parent.grid_rowconfigure(3, weight=1)
+
+        in_frame = ctk.CTkFrame(parent, corner_radius=10)
+        in_frame.grid(row=0, column=0, sticky="nsew", padx=(6, 3), pady=(8, 4))
+        in_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            in_frame,
+            text="INPUT VIDEO",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="gray55",
+        ).grid(row=0, column=0, padx=14, pady=(12, 4), sticky="w")
+
+        in_row = ctk.CTkFrame(in_frame, fg_color="transparent")
+        in_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        in_row.grid_columnconfigure(0, weight=1)
+
+        self._local_input_var = ctk.StringVar()
+        ctk.CTkEntry(
+            in_row,
+            textvariable=self._local_input_var,
+            placeholder_text="Select a B&W video file (MP4, MOV, AVI, MKV)",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            in_row,
+            text="Browse",
+            width=72,
+            command=self._local_browse_input,
+        ).grid(row=0, column=1, padx=(0, 4))
+        ctk.CTkButton(
+            in_row,
+            text="Clear",
+            width=56,
+            fg_color="#3a3a4a",
+            hover_color="#4a4a5a",
+            command=self._local_clear_input,
+        ).grid(row=0, column=2)
+
+        ref_row = ctk.CTkFrame(in_frame, fg_color="transparent")
+        ref_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 4))
+        ref_row.grid_columnconfigure(0, weight=1)
+
+        self._local_ref_var = ctk.StringVar()
+        ctk.CTkEntry(
+            ref_row,
+            textvariable=self._local_ref_var,
+            placeholder_text="Optional reference image for ColorMNet",
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            ref_row,
+            text="Reference",
+            width=92,
+            command=self._local_browse_reference,
+        ).grid(row=0, column=1, padx=(0, 4))
+        ctk.CTkButton(
+            ref_row,
+            text="Clear",
+            width=56,
+            fg_color="#3a3a4a",
+            hover_color="#4a4a5a",
+            command=lambda: self._local_ref_var.set(""),
+        ).grid(row=0, column=2)
+
+        self._local_info_lbl = ctk.CTkLabel(
+            in_frame,
+            text="DDColor -> ColorMNet -> Real-ESRGAN -> Deflicker",
+            font=ctk.CTkFont(size=11),
+            text_color="gray55",
+            anchor="w",
+            justify="left",
+        )
+        self._local_info_lbl.grid(row=3, column=0, padx=14, pady=(0, 10), sticky="w")
+
+        out_frame = ctk.CTkFrame(parent, corner_radius=10)
+        out_frame.grid(row=0, column=1, sticky="nsew", padx=(3, 6), pady=(8, 4))
+        out_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            out_frame,
+            text="OUTPUT DIRECTORY",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="gray55",
+        ).grid(row=0, column=0, padx=14, pady=(12, 4), sticky="w")
+
+        out_row = ctk.CTkFrame(out_frame, fg_color="transparent")
+        out_row.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 4))
+        out_row.grid_columnconfigure(0, weight=1)
+
+        self._local_out_dir_var = ctk.StringVar(
+            value=str(Path.home() / "Videos" / "LocalColorized")
+        )
+        ctk.CTkEntry(
+            out_row,
+            textvariable=self._local_out_dir_var,
+            font=ctk.CTkFont(size=11),
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ctk.CTkButton(
+            out_row,
+            text="Browse",
+            width=72,
+            command=self._local_browse_output,
+        ).grid(row=0, column=1)
+
+        ctk.CTkLabel(
+            out_frame,
+            text="Output filename: {original}_local_colorized.mp4",
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            anchor="w",
+        ).grid(row=2, column=0, padx=14, pady=(0, 10), sticky="w")
+
+        opt_frame = ctk.CTkFrame(parent, corner_radius=10)
+        opt_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=(4, 4))
+        opt_frame.grid_columnconfigure(0, weight=1)
+        opt_frame.grid_columnconfigure(1, weight=1)
+
+        left = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        left.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(left, text="Upscale", anchor="w").grid(row=0, column=0, sticky="w")
+        self._local_upscale_var = ctk.StringVar(value="2x")
+        ctk.CTkOptionMenu(
+            left,
+            values=["2x", "4x"],
+            variable=self._local_upscale_var,
+            width=100,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        ctk.CTkLabel(left, text="ColorMNet memory", anchor="w").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self._local_memory_var = ctk.StringVar(value="balanced")
+        ctk.CTkOptionMenu(
+            left,
+            values=["low_memory", "balanced", "high_quality"],
+            variable=self._local_memory_var,
+            width=140,
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        self._local_half_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
+            left,
+            text="Use FP16 on CUDA (recommended)",
+            variable=self._local_half_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+        right = ctk.CTkFrame(opt_frame, fg_color="transparent")
+        right.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+
+        self._local_skip_colormnet_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            right,
+            text="Skip ColorMNet (faster, less temporal consistency)",
+            variable=self._local_skip_colormnet_var,
+        ).grid(row=0, column=0, sticky="w")
+
+        self._local_skip_esrgan_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            right,
+            text="Skip Real-ESRGAN upscaling",
+            variable=self._local_skip_esrgan_var,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        self._local_deflicker_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(
+            right,
+            text="Run deflicker pass",
+            variable=self._local_deflicker_var,
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+
+        self._local_keep_tmp_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(
+            right,
+            text="Keep intermediate frames (debug)",
+            variable=self._local_keep_tmp_var,
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+        deps_frame = ctk.CTkFrame(parent, corner_radius=10)
+        deps_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 4))
+        deps_frame.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            deps_frame,
+            text=(
+                "Dependencies: torch, huggingface_hub, opencv-python-headless, tqdm, Pillow, "
+                "realesrgan, basicsr, plus cloned repos ./DDColor and ./colormnet"
+            ),
+            font=ctk.CTkFont(size=10),
+            text_color="gray55",
+            justify="left",
+            anchor="w",
+            wraplength=860,
+        ).grid(row=0, column=0, padx=14, pady=10, sticky="w")
+
+        bottom = ctk.CTkFrame(parent, corner_radius=10)
+        bottom.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+        bottom.grid_columnconfigure(0, weight=1)
+
+        btn_bar = ctk.CTkFrame(bottom, fg_color="transparent")
+        btn_bar.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        self._local_run_btn = ctk.CTkButton(
+            btn_bar,
+            text="Run Local Colorization",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=44,
+            width=230,
+            command=self._local_start,
+        )
+        self._local_run_btn.pack(side="left", padx=(0, 8))
+
+        self._local_cancel_btn = ctk.CTkButton(
+            btn_bar,
+            text="Cancel",
+            height=44,
+            width=90,
+            fg_color="#3a3a4a",
+            hover_color="#4a4a5a",
+            state="disabled",
+            command=self._local_cancel,
+        )
+        self._local_cancel_btn.pack(side="left", padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_bar,
+            text="Open Folder",
+            height=44,
+            width=110,
+            fg_color="#3a3a4a",
+            hover_color="#4a4a5a",
+            command=self._local_open_folder,
+        ).pack(side="left")
+
+        prog_row = ctk.CTkFrame(bottom, fg_color="transparent")
+        prog_row.grid(row=1, column=0, sticky="ew", padx=12, pady=2)
+        prog_row.grid_columnconfigure(0, weight=1)
+
+        self._local_prog_bar = ctk.CTkProgressBar(prog_row)
+        self._local_prog_bar.set(0)
+        self._local_prog_bar.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+
+        self._local_prog_lbl = ctk.CTkLabel(
+            prog_row,
+            text="Ready",
+            width=280,
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        )
+        self._local_prog_lbl.grid(row=0, column=1)
+
+        self._local_log_box = ctk.CTkTextbox(
+            bottom,
+            font=ctk.CTkFont(size=11, family="Consolas"),
+            height=120,
+            state="disabled",
+        )
+        self._local_log_box.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 10))
+
+    def _local_browse_input(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Video for Local Colorization",
+            filetypes=[
+                ("Video Files", "*.mp4 *.mov *.avi *.mkv *.wmv *.flv *.m4v *.webm"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if path:
+            self._local_input_var.set(path)
+
+    def _local_clear_input(self) -> None:
+        self._local_input_var.set("")
+
+    def _local_browse_reference(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select Reference Image",
+            filetypes=[
+                ("Image Files", "*.png *.jpg *.jpeg *.webp *.bmp"),
+                ("All Files", "*.*"),
+            ],
+        )
+        if path:
+            self._local_ref_var.set(path)
+
+    def _local_browse_output(self) -> None:
+        d = filedialog.askdirectory(title="Select Output Directory")
+        if d:
+            self._local_out_dir_var.set(d)
+
+    def _local_open_folder(self) -> None:
+        import subprocess as _sp
+
+        d = self._local_out_dir_var.get().strip()
+        if d and Path(d).is_dir():
+            _sp.Popen(["explorer", d])
+        else:
+            messagebox.showinfo("Folder Not Found", "Output folder does not exist yet.", parent=self)
+
+    def _local_start(self) -> None:
+        if self._local_is_running:
+            return
+
+        input_path = self._local_input_var.get().strip()
+        if not input_path:
+            messagebox.showwarning("No Input", "Please select a video file.", parent=self)
+            return
+        if not Path(input_path).is_file():
+            messagebox.showwarning("File Not Found", "The selected input file does not exist.", parent=self)
+            return
+
+        out_dir = self._local_out_dir_var.get().strip()
+        if not out_dir:
+            messagebox.showwarning("No Output Directory", "Please select an output directory.", parent=self)
+            return
+
+        ref_image = self._local_ref_var.get().strip() or None
+        if ref_image and not Path(ref_image).is_file():
+            messagebox.showwarning("Reference Not Found", "The selected reference image does not exist.", parent=self)
+            return
+
+        upscale = 4 if self._local_upscale_var.get().startswith("4") else 2
+        memory_mode = self._local_memory_var.get()
+        skip_colormnet = self._local_skip_colormnet_var.get()
+        skip_esrgan = self._local_skip_esrgan_var.get()
+        deflicker = self._local_deflicker_var.get()
+        keep_tmp = self._local_keep_tmp_var.get()
+        half = self._local_half_var.get()
+
+        stem = Path(input_path).stem
+        output_path = str(Path(out_dir) / f"{stem}_local_colorized.mp4")
+
+        self._local_is_running = True
+        self._local_stop_flag = False
+        self._local_run_btn.configure(state="disabled")
+        self._local_cancel_btn.configure(state="normal")
+        self._local_clear_log()
+        self._local_prog_bar.set(0)
+        self._local_prog_lbl.configure(text="Starting local pipeline...")
+
+        self._local_log("Starting Local Colorization Pipeline")
+        self._local_log("Stack: DDColor -> ColorMNet -> Real-ESRGAN -> Deflicker")
+        self._local_log(f"Input : {input_path}")
+        self._local_log(f"Output: {output_path}")
+
+        t = threading.Thread(
+            target=self._local_worker,
+            args=(
+                input_path,
+                output_path,
+                ref_image,
+                upscale,
+                memory_mode,
+                skip_colormnet,
+                skip_esrgan,
+                deflicker,
+                keep_tmp,
+                half,
+            ),
+            daemon=True,
+        )
+        t.start()
+
+    def _local_cancel(self) -> None:
+        self._local_stop_flag = True
+        self._local_log("Cancellation requested...")
+
+    def _local_worker(
+        self,
+        input_path: str,
+        output_path: str,
+        reference_image: Optional[str],
+        upscale: int,
+        memory_mode: str,
+        skip_colormnet: bool,
+        skip_esrgan: bool,
+        deflicker: bool,
+        keep_tmp: bool,
+        half: bool,
+    ) -> None:
+        try:
+            from .local_color_pipeline import run_local_colorization_pipeline
+
+            run_local_colorization_pipeline(
+                input_video=input_path,
+                output_video=output_path,
+                reference_image=reference_image,
+                upscale=upscale,
+                memory_mode=memory_mode,
+                skip_colormnet=skip_colormnet,
+                skip_esrgan=skip_esrgan,
+                deflicker=deflicker,
+                keep_tmp=keep_tmp,
+                half=half,
+                progress_callback=lambda pct, msg: self._local_queue.put(("prog", pct, msg)),
+                log_callback=lambda msg: self._local_queue.put(("log", msg)),
+                stop_check=lambda: self._local_stop_flag,
+            )
+            self._local_queue.put(("log", f"Saved: {output_path}"))
+            self._local_queue.put(("done", True, output_path))
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Cancelled" in msg:
+                self._local_queue.put(("log", "Local colorization cancelled."))
+            else:
+                self._local_queue.put(("log", f"Error: {msg}"))
+            self._local_queue.put(("done", False, ""))
+        except Exception as exc:
+            self._local_queue.put(("log", f"Unexpected error: {exc}"))
+            self._local_queue.put(("log", traceback.format_exc()))
+            self._local_queue.put(("done", False, ""))
+
+    def _local_log(self, msg: str) -> None:
+        self._local_log_box.configure(state="normal")
+        self._local_log_box.insert("end", msg + "\n")
+        self._local_log_box.see("end")
+        self._local_log_box.configure(state="disabled")
+
+    def _local_clear_log(self) -> None:
+        self._local_log_box.configure(state="normal")
+        self._local_log_box.delete("1.0", "end")
+        self._local_log_box.configure(state="disabled")
+
+    def _poll_local_queue(self) -> None:
+        try:
+            while True:
+                item = self._local_queue.get_nowait()
+                if item[0] == "prog":
+                    self._local_prog_bar.set(max(0.0, min(1.0, item[1])))
+                    self._local_prog_lbl.configure(text=item[2])
+                elif item[0] == "log":
+                    self._local_log(item[1])
+                elif item[0] == "done":
+                    self._local_is_running = False
+                    self._local_run_btn.configure(state="normal")
+                    self._local_cancel_btn.configure(state="disabled")
+                    success, out_path = item[1], item[2]
+                    if success:
+                        self._local_prog_bar.set(1.0)
+                        self._local_prog_lbl.configure(text="Done")
+                        messagebox.showinfo(
+                            "Local Colorization Complete",
+                            f"Colorized video saved:\n{out_path}",
+                            parent=self,
+                        )
+                    else:
+                        self._local_prog_bar.set(0)
+                        self._local_prog_lbl.configure(text="Failed - see log")
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_local_queue)
+
     # ══════════════════════════════════════════════════════════════ ON CLOSE
 
     def _on_close(self) -> None:
         self._stop_flag = True
         self._dl_stop_flag = True
         self._enh_stop_flag = True
+        self._local_stop_flag = True
         self.is_processing = False
         self._save_settings()
         self.destroy()
