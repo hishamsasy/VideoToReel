@@ -22,7 +22,6 @@ yt-dlp>=2025.1.0
 #   pip install diffusers transformers accelerate controlnet-aux
 #   First run downloads ~1.5 GB of ControlNet + SD model weights via HuggingFace.
 #
-# Stage C — FlashVSR one-step super-resolution (Tier-1 upscaler)
-#   git clone https://github.com/OpenImagingLab/FlashVSR
-#   pip install -r FlashVSR/requirements.txt
-#   (Falls back to Real-ESRGAN → PIL LANCZOS4 if not installed)
+# Stage C — AI super-resolution (optional, improves upscaling quality)
+#   pip install realesrgan basicsr
+#   (Falls back to PIL LANCZOS4 if not installed)

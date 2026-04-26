@@ -29,11 +29,9 @@ SOTA 3-STAGE PIPELINE (2026):
     Footage is processed in 12-frame chunks with a 3-frame overlap to
     prevent colour drift across long clips.
 
-  Stage C – One-Step Super-Resolution
-    Tier 1: FlashVSR  (git clone OpenImagingLab/FlashVSR + pip install)
-            One-step diffusion upscaler preserving micro-textures.
-    Tier 2: Real-ESRGAN  (pip install realesrgan basicsr)
-    Tier 3: PIL LANCZOS4 + unsharp-mask
+  Stage C – Super-Resolution
+    Tier 1: Real-ESRGAN  (pip install realesrgan basicsr)
+    Tier 2: PIL LANCZOS4 + unsharp-mask
 
 Maximum input duration: 60 seconds.
 """
@@ -41,8 +39,10 @@ Maximum input duration: 60 seconds.
 import os
 import shutil
 import subprocess
+import sys
 import threading
 import urllib.request
+import importlib.util
 from pathlib import Path
 from typing import Callable, Optional, Tuple
 
@@ -88,7 +88,7 @@ SOTA_CHUNK_FRAMES  = 12   # frames per chunk
 SOTA_CHUNK_OVERLAP = 3    # frames re-processed at the start of each chunk
 #                           so the EMA state can warm up from prior context
 # Hugging Face model IDs for diffusion colorization
-_CTRL_NET_ID = "lllyasviel/sd-controlnet-scribble"
+_CTRL_NET_ID = "lllyasviel/sd-controlnet-canny"
 _SD_BASE_ID  = "runwayml/stable-diffusion-v1-5"
 # ControlNet conditioning scale — lower = looser structure adherence
 _CTRL_SCALE  = 0.9
@@ -279,6 +279,7 @@ class VideoEnhancer:
         self._colorizer_net = None
         self._colorizer_backend = ""
         self._torch = None
+        self._torch_device = "cpu"
         self._torch_colorizer = None
         self._colorizer_lock = threading.Lock()
         # SOTA diffusion colorizer (lazy-loaded on first SOTA run)
@@ -554,13 +555,21 @@ class VideoEnhancer:
                     f"Failed to download PyTorch colorization weights: {last_err}"
                 ) from last_err
 
-        _lcb(log_callback, "   Loading PyTorch ECCV16 model…")
-        model = _build_torch_eccv16_model(torch).eval()
-        state = torch.load(str(pth_path), map_location="cpu")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda":
+            try:
+                torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
+
+        _lcb(log_callback, f"   Loading PyTorch ECCV16 model on {device.upper()}…")
+        model = _build_torch_eccv16_model(torch).to(device).eval()
+        state = torch.load(str(pth_path), map_location=device)
         model.load_state_dict(state)
         model.eval()
 
         self._torch = torch
+        self._torch_device = device
         self._torch_colorizer = model
 
     def _colorize_frame(
@@ -570,18 +579,20 @@ class VideoEnhancer:
         prev_L: Optional[np.ndarray],
         alpha: float,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self._torch_colorizer is not None and self._colorizer_backend.startswith("pytorch"):
-            return self._colorize_frame_torch(bgr, ema_ab, prev_L, alpha)
-
         """
-        Colourises one BGR frame via the Zhang et al. DNN.
+        Colourises one BGR frame.
 
-        Temporal EMA smoothing on AB channels prevents colour flicker.
-        Scene-cut detection (L-channel delta > threshold) hard-resets the
-        EMA so old-scene colours do not bleed into the new shot.
+        Uses PyTorch ECCV16 if available, otherwise falls back to Zhang
+        et al. Caffe DNN.  Temporal EMA smoothing on AB channels prevents
+        colour flicker.  Scene-cut detection (L-channel delta > threshold)
+        hard-resets the EMA so old-scene colours do not bleed into the new
+        shot.
 
         Returns (colourised_bgr, updated_ema_ab, current_L_channel).
         """
+        if self._torch_colorizer is not None and self._colorizer_backend.startswith("pytorch"):
+            return self._colorize_frame_torch(bgr, ema_ab, prev_L, alpha)
+
         h, w = bgr.shape[:2]
         scaled = bgr.astype(np.float32) / 255.0
         lab    = cv2.cvtColor(scaled, cv2.COLOR_BGR2LAB)
@@ -632,8 +643,9 @@ class VideoEnhancer:
         # Model runs on 256x256 L channel and predicts AB.
         L_rs = cv2.resize(L_full, (256, 256), interpolation=cv2.INTER_AREA)
         inp = self._torch.from_numpy(L_rs).unsqueeze(0).unsqueeze(0).float()
+        inp = inp.to(self._torch_device, non_blocking=True)
         with self._torch.no_grad():
-            out_ab = self._torch_colorizer(inp).cpu().numpy()[0].transpose(1, 2, 0)
+            out_ab = self._torch_colorizer(inp).float().cpu().numpy()[0].transpose(1, 2, 0)
 
         ab_pred = cv2.resize(out_ab, (w, h), interpolation=cv2.INTER_LINEAR)
 
@@ -690,6 +702,15 @@ class VideoEnhancer:
         for i in range(n):
             lo = max(0, i - hw)
             hi = min(n - 1, i + hw)
+            # OpenCV requires temporalWindowSize to be odd.  When the frame
+            # is near a boundary, trim one side so the window stays odd.
+            win_len = hi - lo + 1
+            if win_len % 2 == 0:
+                # Prefer trimming the side farther from the target frame.
+                if i - lo > hi - i:
+                    lo += 1
+                else:
+                    hi -= 1
             win = frames[lo : hi + 1]
             idx = i - lo  # index of the target frame inside the window
 
@@ -731,6 +752,19 @@ class VideoEnhancer:
         if getattr(self, "_diff_pipe", None) is not None:
             return True
 
+        required = ["torch", "diffusers", "transformers", "accelerate", "controlnet_aux"]
+        missing = [name for name in required if importlib.util.find_spec(name) is None]
+        if missing:
+            _lcb(
+                log_callback,
+                "   ⚠  SOTA Stage B dependencies are missing in the active Python "
+                f"({sys.executable}) — falling back to ECCV16 colorizer.\n"
+                f"      Missing: {', '.join(missing)}\n"
+                f"      To enable SOTA colorization in this environment:\n"
+                f"        python -m pip install diffusers transformers accelerate controlnet-aux",
+            )
+            return False
+
         try:
             import torch                          # type: ignore
             from diffusers import (              # type: ignore
@@ -738,13 +772,13 @@ class VideoEnhancer:
                 ControlNetModel,
                 UniPCMultistepScheduler,
             )
-        except ImportError as exc:
+        except Exception as exc:
             _lcb(
                 log_callback,
-                f"   ⚠  diffusers / transformers not installed — "
+                "   ⚠  Diffusion dependencies are installed but failed to import; "
                 f"falling back to ECCV16 colorizer.\n"
-                f"      To enable SOTA colorization:\n"
-                f"        pip install diffusers transformers accelerate controlnet-aux",
+                f"      Active Python: {sys.executable}\n"
+                f"      Import error: {exc}",
             )
             return False
 
@@ -857,10 +891,13 @@ class VideoEnhancer:
                 cv2.COLOR_RGB2BGR,
             )
 
-            # Apply EMA smoothing in LAB space for temporal consistency.
-            lab = cv2.cvtColor(result_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
-            L_full = lab[:, :, 0]
-            ab_pred = lab[:, :, 1:]
+            # Extract AB from diffusion output but keep the ORIGINAL L channel
+            # so the diffusion model cannot alter brightness / structure.
+            diff_lab = cv2.cvtColor(result_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
+            ab_pred = diff_lab[:, :, 1:]
+
+            orig_lab = cv2.cvtColor(bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2LAB)
+            L_full = orig_lab[:, :, 0]
 
             is_cut = (
                 prev_L is not None
@@ -1099,37 +1136,11 @@ class VideoEnhancer:
         """
         Return  fn(bgr_frame) -> bgr_frame  for the best available upscaler.
 
-        Tier 1 – FlashVSR (CVPR 2026 one-step diffusion upscaler).
-                 Requires:  git clone https://github.com/OpenImagingLab/FlashVSR
-                            pip install -r FlashVSR/requirements.txt
-        Tier 2 – Real-ESRGAN via the 'realesrgan' + 'basicsr' packages.
-        Tier 3 – PIL LANCZOS4 + unsharp-mask  (always available).
+        Tier 1 – Real-ESRGAN via the 'realesrgan' + 'basicsr' packages.
+                 pip install realesrgan basicsr
+        Tier 2 – PIL LANCZOS4 + unsharp-mask  (always available).
         """
-        # ── Tier 1: FlashVSR ──────────────────────────────────────────────
-        try:
-            from flashvsr import FlashVSRUpscaler  # type: ignore
-
-            _lcb(log_callback, "   Loading FlashVSR one-step diffusion upscaler…")
-            upscaler = FlashVSRUpscaler(scale=factor)
-            _cb(progress_callback, 0.71, f"FlashVSR {factor}× ready")
-            _lcb(log_callback, f"   ✓  FlashVSR {factor}× loaded.")
-
-            def _flashvsr_fn(bgr: np.ndarray) -> np.ndarray:
-                return upscaler.upscale(bgr)
-
-            return _flashvsr_fn
-
-        except ImportError:
-            _lcb(
-                log_callback,
-                "   FlashVSR not found — trying Real-ESRGAN.\n"
-                "   (To install FlashVSR: git clone https://github.com/OpenImagingLab/FlashVSR"
-                " && pip install -r FlashVSR/requirements.txt)",
-            )
-        except Exception as exc:
-            _lcb(log_callback, f"   FlashVSR load error: {exc} — trying Real-ESRGAN.")
-
-        # ── Tier 2: Real-ESRGAN ───────────────────────────────────────────
+        # ── Tier 1: Real-ESRGAN ───────────────────────────────────────────
         try:
             from realesrgan import RealESRGANer              # type: ignore
             from basicsr.archs.rrdbnet_arch import RRDBNet   # type: ignore
@@ -1173,7 +1184,7 @@ class VideoEnhancer:
         except Exception:
             pass  # fall through to PIL baseline
 
-        # ── Tier 3: PIL LANCZOS4 + unsharp-mask ──────────────────────────
+        # ── Tier 2: PIL LANCZOS4 + unsharp-mask ──────────────────────────
         _cb(
             progress_callback, 0.08,
             f"Using LANCZOS {factor}× upscale "
@@ -1225,6 +1236,10 @@ class VideoEnhancer:
             result = subprocess.run(cmd, capture_output=True, timeout=600)
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.decode(errors="replace"))
-        except Exception:
+        except Exception as exc:
             # ffmpeg failed — copy raw video-only output as fallback
+            print(
+                f"[Enhancer] H.264 encoding failed ({exc}); "
+                f"falling back to raw mp4v copy. Playback may be limited."
+            )
             shutil.copy2(video_only, output)
